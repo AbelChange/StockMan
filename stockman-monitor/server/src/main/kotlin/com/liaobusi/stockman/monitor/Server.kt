@@ -97,6 +97,77 @@ fun Application.monitorModule() {
         get("/api/sync/history/progress") {
             call.respond(engine.historyStocksSyncProgress())
         }
+        get("/api/monitor/config") {
+            call.respond(engine.monitorConfig())
+        }
+        post("/api/monitor/config") {
+            val request = call.receive<MonitorConfigRequest>()
+            call.respond(engine.saveMonitorConfig(request))
+        }
+        get("/api/monitor/status") {
+            call.respond(engine.monitorStatus())
+        }
+        post("/api/monitor/start") {
+            call.respond(engine.startMonitor())
+        }
+        post("/api/monitor/stop") {
+            call.respond(engine.stopMonitor())
+        }
+        get("/api/monitor/targets") {
+            call.respond(engine.monitorTargets())
+        }
+        post("/api/monitor/follow") {
+            call.respond(engine.upsertMonitorFollow(call.receive<MonitorFollowRequest>()))
+        }
+        post("/api/monitor/follow/remove") {
+            val code = call.request.queryParameters["code"]?.trim().orEmpty()
+            val type = call.request.queryParameters["type"]?.toIntOrNull() ?: 1
+            call.respond(engine.removeMonitorFollow(code, type))
+        }
+        get("/api/monitor/follows") {
+            call.respond(engine.monitorFollows())
+        }
+        post("/api/monitor/bk-stocks") {
+            call.respond(engine.upsertBkStocks(call.receive<MonitorBkStocksRequest>()))
+        }
+        post("/api/monitor/unusual") {
+            call.respond(engine.insertUnusualAction(call.receive<MonitorUnusualRequest>()))
+        }
+        post("/api/monitor/targets/refresh") {
+            val date = call.request.queryParameters["date"]?.toIntOrNull()
+                ?: ChinaMarketCalendar.currentRealtimeSnapshotDate()
+            val pool = engine.syncLimitUpPool(date)
+            runCatching { engine.syncKplLiveUnusual() }
+                .onFailure { serverLogger.warn("sync KPL unusual failed: {}", it.message) }
+            val replay = runCatching { engine.syncZtReplay(date) }.getOrNull()
+            call.respond(MonitorTargetsRefreshResult(pool, replay, engine.monitorTargets()))
+        }
+        post("/api/sync/unusual/kpl") {
+            runCatching {
+                engine.syncKplLiveUnusual()
+            }.onSuccess {
+                call.respond(it)
+            }.onFailure {
+                serverLogger.warn("HTTP POST /api/sync/unusual/kpl failed: {}", it.message)
+                call.respond(HttpStatusCode.BadRequest, mapOf("error" to (it.message ?: "kpl unusual sync failed")))
+            }
+        }
+        get("/api/monitor/alerts") {
+            val code = call.request.queryParameters["code"]?.trim()?.takeIf { it.isNotBlank() }
+            val date = call.request.queryParameters["date"]?.toIntOrNull()
+            val limit = call.request.queryParameters["limit"]?.toIntOrNull() ?: 100
+            call.respond(engine.monitorAlerts(code = code, date = date, limit = limit))
+        }
+        post("/api/sync/limit-up-pool") {
+            val date = call.request.queryParameters["date"]?.toIntOrNull()
+                ?: ChinaMarketCalendar.currentHistoryTargetDate()
+            call.respond(engine.syncLimitUpPool(date))
+        }
+        post("/api/sync/zt-replay") {
+            val date = call.request.queryParameters["date"]?.toIntOrNull()
+                ?: ChinaMarketCalendar.currentHistoryTargetDate()
+            call.respond(engine.syncZtReplay(date))
+        }
         post("/api/sync/history/start") {
             val codes = call.request.queryParameters.getAll("code").orEmpty() +
                 call.request.queryParameters["codes"].orEmpty().split(',').filter { it.isNotBlank() }
@@ -433,7 +504,7 @@ private fun dbViewerHtml(): String = """
       border-radius: 8px;
       background: #fbfcfd;
     }
-    .chart svg { width: 100%; height: 280px; display: block; }
+    .chart svg { width: 100%; height: 380px; display: block; }
     .chartTip {
       min-height: 30px;
       margin: 0 16px 10px;
@@ -973,49 +1044,115 @@ function renderDailyChart(data) {
   const body = document.getElementById("chartBody");
   const lines = data.lines || [];
   document.getElementById("chartTitle").textContent = data.code + " " + (data.name || "") + "，" + lines.length + " 条";
-  document.getElementById("chartTip").textContent = "悬停曲线查看开盘/收盘价格";
+  document.getElementById("chartTip").textContent = "悬停 K 线查看开高低收、涨跌幅和均线";
   if (lines.length === 0) {
     body.innerHTML = '<div class="error">没有日线数据</div>';
     return;
   }
   const width = 1000;
-  const height = 260;
-  const pad = 34;
-  const values = lines.map(item => item.closePrice);
-  const min = Math.min.apply(null, values);
-  const max = Math.max.apply(null, values);
+  const height = 360;
+  const left = 56;
+  const right = 64;
+  const top = 34;
+  const bottom = 42;
+  const plotW = width - left - right;
+  const plotH = height - top - bottom;
+  const allPrices = [];
+  lines.forEach(item => {
+    allPrices.push(item.openPrice, item.closePrice, item.highest, item.lowest);
+  });
+  const ma = (period, index) => {
+    if (index + 1 < period) return null;
+    let sum = 0;
+    for (let i = index - period + 1; i <= index; i += 1) sum += lines[i].closePrice;
+    return sum / period;
+  };
+  const ma5 = lines.map((_, index) => ma(5, index));
+  const ma10 = lines.map((_, index) => ma(10, index));
+  const ma20 = lines.map((_, index) => ma(20, index));
+  [ma5, ma10, ma20].forEach(list => list.forEach(value => { if (value != null) allPrices.push(value); }));
+  const rawMin = Math.min.apply(null, allPrices);
+  const rawMax = Math.max.apply(null, allPrices);
+  const padding = Math.max(0.01, (rawMax - rawMin) * 0.08);
+  const min = rawMin - padding;
+  const max = rawMax + padding;
   const span = Math.max(0.01, max - min);
-  const x = index => pad + index * ((width - pad * 2) / Math.max(1, lines.length - 1));
-  const y = value => height - pad - ((value - min) / span) * (height - pad * 2);
-  const points = lines.map((item, index) => x(index).toFixed(1) + "," + y(item.closePrice).toFixed(1)).join(" ");
+  const step = plotW / Math.max(1, lines.length);
+  const candleW = Math.max(2.5, Math.min(10, step * 0.62));
+  const x = index => left + step * index + step / 2;
+  const y = value => top + ((max - value) / span) * plotH;
+  const maPath = (values, color) => {
+    const points = values.map((value, index) => {
+      if (value == null) return null;
+      return x(index).toFixed(1) + "," + y(value).toFixed(1);
+    }).filter(Boolean).join(" ");
+    if (!points) return "";
+    return '<polyline points="' + points + '" fill="none" stroke="' + color + '" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/>';
+  };
   const last = lines[lines.length - 1];
   const first = lines[0];
-  const hitWidth = Math.max(6, (width - pad * 2) / Math.max(1, lines.length - 1));
-  const hovers = lines.map((item, index) => {
+  const grid = Array.from({ length: 5 }, (_, i) => {
+    const value = max - (span * i / 4);
+    const gy = y(value);
+    return '<line x1="' + left + '" y1="' + gy.toFixed(1) + '" x2="' + (width - right) + '" y2="' + gy.toFixed(1) + '" stroke="#edf0f4"/>' +
+      '<text x="' + (width - right + 8) + '" y="' + (gy + 4).toFixed(1) + '" fill="#66707c" font-size="11">' + value.toFixed(2) + '</text>';
+  }).join("");
+  const candles = lines.map((item, index) => {
     const cx = x(index);
-    const cy = y(item.closePrice);
-    const label = item.date + ' 开 ' + item.openPrice.toFixed(2) + ' / 收 ' + item.closePrice.toFixed(2) + ' / ' + item.chg.toFixed(2) + '%';
-    return '<rect class="hit" x="' + (cx - hitWidth / 2).toFixed(1) + '" y="' + pad + '" width="' + hitWidth.toFixed(1) + '" height="' + (height - pad * 2) + '" data-label="' + label + '"></rect>' +
-      '<circle class="hoverDot" cx="' + cx.toFixed(1) + '" cy="' + cy.toFixed(1) + '" r="5" fill="#ef4444"></circle>';
+    const up = item.closePrice >= item.openPrice;
+    const color = up ? "#d92d20" : "#039855";
+    const highY = y(item.highest);
+    const lowY = y(item.lowest);
+    const openY = y(item.openPrice);
+    const closeY = y(item.closePrice);
+    const bodyY = Math.min(openY, closeY);
+    const bodyH = Math.max(1.5, Math.abs(openY - closeY));
+    const fill = up ? "#fff5f3" : "#ecfdf3";
+    const label = item.date + '  开 ' + item.openPrice.toFixed(2) +
+      '  高 ' + item.highest.toFixed(2) +
+      '  低 ' + item.lowest.toFixed(2) +
+      '  收 ' + item.closePrice.toFixed(2) +
+      '  涨跌 ' + item.chg.toFixed(2) + '%' +
+      '  MA5 ' + (ma5[index] == null ? '-' : ma5[index].toFixed(2)) +
+      '  MA10 ' + (ma10[index] == null ? '-' : ma10[index].toFixed(2)) +
+      '  MA20 ' + (ma20[index] == null ? '-' : ma20[index].toFixed(2));
+    return '<g>' +
+      '<line x1="' + cx.toFixed(1) + '" y1="' + highY.toFixed(1) + '" x2="' + cx.toFixed(1) + '" y2="' + lowY.toFixed(1) + '" stroke="' + color + '" stroke-width="1.2"/>' +
+      '<rect x="' + (cx - candleW / 2).toFixed(1) + '" y="' + bodyY.toFixed(1) + '" width="' + candleW.toFixed(1) + '" height="' + bodyH.toFixed(1) + '" fill="' + fill + '" stroke="' + color + '" stroke-width="1.2"/>' +
+      '<rect class="hit" x="' + (cx - step / 2).toFixed(1) + '" y="' + top + '" width="' + Math.max(3, step).toFixed(1) + '" height="' + plotH + '" data-label="' + label + '"></rect>' +
+      '<circle class="hoverDot" cx="' + cx.toFixed(1) + '" cy="' + closeY.toFixed(1) + '" r="4" fill="' + color + '"></circle>' +
+      '</g>';
+  }).join("");
+  const dateTicks = [
+    { index: 0, anchor: "start" },
+    { index: Math.floor((lines.length - 1) / 2), anchor: "middle" },
+    { index: lines.length - 1, anchor: "end" }
+  ].map(tick => {
+    const item = lines[tick.index];
+    return '<text x="' + x(tick.index).toFixed(1) + '" y="' + (height - 12) + '" fill="#66707c" font-size="11" text-anchor="' + tick.anchor + '">' + item.date + '</text>';
   }).join("");
   body.innerHTML =
     '<svg id="dailySvg" viewBox="0 0 ' + width + ' ' + height + '" role="img">' +
-    '<line x1="' + pad + '" y1="' + pad + '" x2="' + pad + '" y2="' + (height - pad) + '" stroke="#d5dce5"/>' +
-    '<line x1="' + pad + '" y1="' + (height - pad) + '" x2="' + (width - pad) + '" y2="' + (height - pad) + '" stroke="#d5dce5"/>' +
-    '<text x="' + pad + '" y="22" fill="#66707c" font-size="13">高 ' + max.toFixed(2) + '</text>' +
-    '<text x="' + pad + '" y="' + (height - 10) + '" fill="#66707c" font-size="13">低 ' + min.toFixed(2) + '</text>' +
-    '<text x="' + (width - 180) + '" y="22" fill="#20242a" font-size="14">收 ' + last.closePrice.toFixed(2) + ' / ' + last.chg.toFixed(2) + '%</text>' +
-    '<polyline points="' + points + '" fill="none" stroke="#2563eb" stroke-width="2.5"/>' +
-    '<circle cx="' + x(lines.length - 1).toFixed(1) + '" cy="' + y(last.closePrice).toFixed(1) + '" r="4" fill="#2563eb"/>' +
-    '<text x="' + pad + '" y="' + (height - 5) + '" fill="#66707c" font-size="12">' + first.date + '</text>' +
-    '<text x="' + (width - 90) + '" y="' + (height - 5) + '" fill="#66707c" font-size="12">' + last.date + '</text>' +
-    hovers +
+    '<rect x="0" y="0" width="' + width + '" height="' + height + '" fill="#ffffff"/>' +
+    grid +
+    '<line x1="' + left + '" y1="' + top + '" x2="' + left + '" y2="' + (height - bottom) + '" stroke="#d5dce5"/>' +
+    '<line x1="' + left + '" y1="' + (height - bottom) + '" x2="' + (width - right) + '" y2="' + (height - bottom) + '" stroke="#d5dce5"/>' +
+    '<text x="' + left + '" y="22" fill="#20242a" font-size="13" font-weight="700">' + data.code + ' ' + (data.name || '') + '</text>' +
+    '<text x="' + (width - 270) + '" y="22" fill="#20242a" font-size="13">收 ' + last.closePrice.toFixed(2) + ' / ' + last.chg.toFixed(2) + '%</text>' +
+    '<text x="' + left + '" y="' + (height - 24) + '" fill="#d92d20" font-size="11">MA5</text>' +
+    '<text x="' + (left + 40) + '" y="' + (height - 24) + '" fill="#f79009" font-size="11">MA10</text>' +
+    '<text x="' + (left + 88) + '" y="' + (height - 24) + '" fill="#2563eb" font-size="11">MA20</text>' +
+    candles +
+    maPath(ma5, "#d92d20") +
+    maPath(ma10, "#f79009") +
+    maPath(ma20, "#2563eb") +
+    dateTicks +
     '</svg>';
   const tip = document.getElementById("chartTip");
   document.querySelectorAll("#dailySvg .hit").forEach(node => {
     node.addEventListener("mouseenter", () => { tip.textContent = node.dataset.label || ""; });
     node.addEventListener("mousemove", () => { tip.textContent = node.dataset.label || ""; });
-    node.addEventListener("mouseleave", () => { tip.textContent = "悬停曲线查看开盘/收盘价格"; });
+    node.addEventListener("mouseleave", () => { tip.textContent = "悬停 K 线查看开高低收、涨跌幅和均线"; });
   });
 }
 

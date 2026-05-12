@@ -11,6 +11,8 @@ import kotlinx.browser.window
 import kotlinx.coroutines.await
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.promise
+import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.contentOrNull
@@ -86,20 +88,35 @@ fun main() {
 fun MonitorApp() {
     val stocks = remember { mutableStateListOf<StockTick>() }
     val alerts = remember { mutableStateListOf<AlertEvent>() }
-    val selectedSources = remember { mutableStateListOf<String>().also { list -> list.addAll(monitorSources.map { it.id }) } }
+    val selectedSources = remember { mutableStateListOf<String>() }
     var connected by remember { mutableStateOf(false) }
     var activePage by remember { mutableStateOf("monitor") }
     var monitorSourcesByCode by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    var monitorTargetsByCode by remember { mutableStateOf<Map<String, MonitorTarget>>(emptyMap()) }
     var monitorSourceStatus by remember { mutableStateOf("来源加载中") }
     var customCodes by remember { mutableStateOf("") }
+    var customBkCodes by remember { mutableStateOf("") }
     var monitoringEnabled by remember { mutableStateOf(false) }
     var monitorRefreshSeconds by remember { mutableStateOf(5) }
+    var backendTargetSources by remember { mutableStateOf(listOf("limit_up")) }
+    var cooldownSeconds by remember { mutableStateOf(60) }
     var tradingTime by remember { mutableStateOf(isTradingTime()) }
     var notificationState by remember {
         mutableStateOf(runCatching { Notification.permission }.getOrDefault("default"))
     }
 
     LaunchedEffect(Unit) {
+        runCatching {
+            val config = loadMonitorConfig()
+            monitoringEnabled = config.enabled
+            backendTargetSources = normalizeBackendTargetSources(config.targetSources)
+            customCodes = config.customCodes.joinToString(" ")
+            customBkCodes = config.customBkCodes.joinToString(" ")
+            cooldownSeconds = config.cooldownSeconds
+            val recentAlerts = loadRecentAlerts()
+            alerts.clear()
+            alerts.addAll(recentAlerts.take(30))
+        }
         connectWebSocket(
             onOpen = { connected = true },
             onClose = { connected = false },
@@ -127,11 +144,13 @@ fun MonitorApp() {
         }
     }
 
-    LaunchedEffect(selectedSources.toList(), customCodes, monitorRefreshSeconds) {
+    LaunchedEffect(selectedSources.toList(), customCodes, monitorRefreshSeconds, backendTargetSources) {
         while (true) {
             val result = loadMonitorSourceMap(selectedSources.toList(), customCodes)
-            monitorSourcesByCode = result.sourcesByCode
-            monitorSourceStatus = result.message
+            val backend = loadBackendTargetMap()
+            monitorSourcesByCode = mergeSourceMaps(result.sourcesByCode, backend.sourcesByCode)
+            monitorTargetsByCode = backend.targetsByCode
+            monitorSourceStatus = listOf(result.message, backend.message).filter { it.isNotBlank() }.joinToString("；")
             delay(monitorRefreshSeconds.coerceIn(MONITOR_REFRESH_MIN_SECONDS, MONITOR_REFRESH_MAX_SECONDS) * 1_000L)
         }
     }
@@ -151,15 +170,30 @@ fun MonitorApp() {
                 "monitor" -> {
                 MonitorSourcePanel(
                     selectedSources = selectedSources,
-                    customCodes = customCodes,
+                    backendTargetSources = backendTargetSources,
+                    cooldownSeconds = cooldownSeconds,
                     status = monitorSourceStatus,
                     onToggleSource = { id ->
                         if (selectedSources.contains(id)) selectedSources.remove(id) else selectedSources.add(id)
                     },
-                    onCustomCodesChange = { customCodes = it },
+                    onToggleBackendTarget = { id ->
+                        backendTargetSources = if (backendTargetSources.contains(id)) {
+                            backendTargetSources - id
+                        } else {
+                            backendTargetSources + id
+                        }
+                    },
+                    onCooldownSecondsChange = { cooldownSeconds = it.coerceIn(5, 3600) },
                     onRefresh = {
-                        loadMonitorSourceMapAsync(selectedSources.toList(), customCodes) { result ->
+                        loadMonitorSourceMapAsync(
+                            selectedSourceIds = selectedSources.toList(),
+                            customCodes = customCodes,
+                            customBkCodes = customBkCodes,
+                            backendTargetSources = backendTargetSources,
+                            cooldownSeconds = cooldownSeconds
+                        ) { result ->
                             monitorSourcesByCode = result.sourcesByCode
+                            monitorTargetsByCode = result.targetsByCode
                             monitorSourceStatus = result.message
                         }
                     }
@@ -167,30 +201,45 @@ fun MonitorApp() {
                 val monitorStocks = stocks
                     .mapNotNull { stock ->
                         val source = monitorSourcesByCode[stock.code]
-                        if (source == null) null else MonitorStock(stock, source)
+                        if (source == null) null else MonitorStock(stock, source, monitorTargetsByCode[stock.code])
                     }
                     .sortedByDescending { it.tick.chg }
-                Div({ classes(AppStyles.grid) }) {
-                    Div({ classes(AppStyles.panel, AppStyles.marketPanel) }) {
-                        MonitorSectionTitle(
-                            enabled = monitoringEnabled,
-                            tradingTime = tradingTime,
-                            refreshSeconds = monitorRefreshSeconds,
-                            meta = "${monitorStocks.size} / ${stocks.size} 只标的",
-                            onRefreshSecondsChange = { monitorRefreshSeconds = it.coerceIn(MONITOR_REFRESH_MIN_SECONDS, MONITOR_REFRESH_MAX_SECONDS) },
-                            onStart = {
-                                if (isTradingTime()) {
-                                    monitoringEnabled = true
-                                }
-                            },
-                            onStop = { monitoringEnabled = false }
-                        )
-                        StockTable(monitorStocks)
-                    }
-                    Div({ classes(AppStyles.panel) }) {
-                        SectionTitle("异动通知", if (monitoringEnabled) "${alerts.size} 条" else "未开始监控")
-                        AlertList(alerts)
-                    }
+                Div({ classes(AppStyles.panel, AppStyles.alertPanel) }) {
+                    SectionTitle("异动通知", if (monitoringEnabled) "${alerts.size} 条" else "未开始监控")
+                    AlertList(alerts)
+                }
+                Div({ classes(AppStyles.panel, AppStyles.marketPanel) }) {
+                    MonitorSectionTitle(
+                        enabled = monitoringEnabled,
+                        tradingTime = tradingTime,
+                        refreshSeconds = monitorRefreshSeconds,
+                        meta = "${monitorStocks.size} / ${stocks.size} 只标的",
+                        onRefreshSecondsChange = { monitorRefreshSeconds = it.coerceIn(MONITOR_REFRESH_MIN_SECONDS, MONITOR_REFRESH_MAX_SECONDS) },
+                        onStart = {
+                            if (isTradingTime()) {
+                                saveMonitorConfigAsync(true, backendTargetSources, customCodes, customBkCodes, cooldownSeconds) {}
+                                postMonitorAction("start")
+                                monitoringEnabled = true
+                            }
+                        },
+                        onStop = {
+                            postMonitorAction("stop")
+                            monitoringEnabled = false
+                        }
+                    )
+                    StockTable(
+                        stocks = monitorStocks,
+                        onFollowStock = { stock ->
+                            if (window.confirm("关注个股 ${stock.code} ${stock.name}？")) {
+                                updateMonitorFollowAsync(stock.code, 1, true) {}
+                            }
+                        },
+                        onFollowBk = { bkCode ->
+                            if (window.confirm("关注板块 $bkCode？")) {
+                                updateMonitorFollowAsync(bkCode, 2, true) {}
+                            }
+                        }
+                    )
                 }
                 ManualTickPanel { alert ->
                     alerts.add(0, alert)
@@ -199,6 +248,7 @@ fun MonitorApp() {
                 }
                 EastMoneyDebugPanel()
                 }
+                "follows" -> FollowPage()
                 "kpl-live" -> KplLivePage()
                 "jiuyang" -> JiuyangPage()
             }
@@ -246,6 +296,10 @@ fun Header(
                 onClick { onPageChange("monitor") }
             }) { Text("监控") }
             Button(attrs = {
+                classes(if (activePage == "follows") AppStyles.primaryButton else AppStyles.secondaryButton)
+                onClick { onPageChange("follows") }
+            }) { Text("关注") }
+            Button(attrs = {
                 classes(if (activePage == "kpl-live") AppStyles.primaryButton else AppStyles.secondaryButton)
                 onClick { onPageChange("kpl-live") }
             }) { Text("开盘啦 异动直播") }
@@ -268,6 +322,157 @@ fun Header(
                         else -> "开启通知"
                     }
                 )
+            }
+        }
+    }
+}
+
+@Composable
+fun FollowPage() {
+    var follows by remember { mutableStateOf<List<MonitorFollowItem>>(emptyList()) }
+    var status by remember { mutableStateOf("加载中") }
+
+    fun reload() {
+        kotlinx.coroutines.GlobalScope.promise { loadMonitorFollows() }
+            .then {
+                follows = it
+                status = "共 ${it.size} 条关注"
+                null
+            }
+            .catch {
+                status = "加载失败: ${it.message ?: "unknown"}"
+                null
+            }
+    }
+
+    LaunchedEffect(Unit) { reload() }
+
+    Div({ classes(AppStyles.panel) }) {
+        Div({ classes(AppStyles.sourceHeader) }) {
+            Div {
+                H2 { Text("关注列表") }
+                P { Text(status) }
+            }
+            Button(attrs = {
+                classes(AppStyles.secondaryButton)
+                onClick { reload() }
+            }) { Text("刷新") }
+        }
+        FollowGroup(
+            title = "个股",
+            follows = follows.filter { it.type == 1 },
+            onChanged = { reload() }
+        )
+        FollowGroup(
+            title = "板块",
+            follows = follows.filter { it.type == 2 },
+            onChanged = { reload() }
+        )
+    }
+}
+
+@Composable
+private fun FollowGroup(
+    title: String,
+    follows: List<MonitorFollowItem>,
+    onChanged: () -> Unit
+) {
+    H2({ classes(AppStyles.followGroupTitle) }) { Text(title) }
+    if (follows.isEmpty()) {
+        Div({ classes(AppStyles.emptyState) }) { Text("暂无关注") }
+        return
+    }
+    Table({ classes(AppStyles.table) }) {
+        Thead {
+            Tr {
+                Th { Text("代码") }
+                Th { Text("名称") }
+                Th { Text("排序") }
+                Th { Text("操作") }
+            }
+        }
+        Tbody {
+            follows.forEachIndexed { index, item ->
+                FollowRow(
+                    item = item,
+                    onSave = { name, order ->
+                        updateMonitorFollowAsync(
+                            code = item.code,
+                            type = item.type,
+                            add = true,
+                            name = name,
+                            stickyOnTop = order
+                        ) { onChanged() }
+                    },
+                    onMove = { delta ->
+                        val order = (item.stickyOnTop + delta).coerceAtLeast(0)
+                        updateMonitorFollowAsync(
+                            code = item.code,
+                            type = item.type,
+                            add = true,
+                            name = item.name,
+                            stickyOnTop = order
+                        ) { onChanged() }
+                    },
+                    onDelete = {
+                        if (window.confirm("删除关注 ${item.code} ${item.name}？")) {
+                            updateMonitorFollowAsync(item.code, item.type, false) { onChanged() }
+                        }
+                    },
+                    canMoveUp = index > 0,
+                    canMoveDown = index < follows.lastIndex
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun FollowRow(
+    item: MonitorFollowItem,
+    onSave: (String, Int) -> Unit,
+    onMove: (Int) -> Unit,
+    onDelete: () -> Unit,
+    canMoveUp: Boolean,
+    canMoveDown: Boolean
+) {
+    var name by remember(item.code, item.type, item.updatedAt) { mutableStateOf(item.name) }
+    var order by remember(item.code, item.type, item.updatedAt) { mutableStateOf(item.stickyOnTop.toString()) }
+    Tr {
+        Td { Text(item.code) }
+        Td {
+            Input(type = InputType.Text) {
+                value(name)
+                onInput { name = it.value }
+            }
+        }
+        Td {
+            Input(type = InputType.Number) {
+                value(order)
+                attr("min", "0")
+                onInput { order = it.value.toString() }
+            }
+        }
+        Td {
+            Div({ classes(AppStyles.followActions) }) {
+                Button(attrs = {
+                    classes(AppStyles.secondaryButton)
+                    onClick { onSave(name, order.toIntOrNull() ?: item.stickyOnTop) }
+                }) { Text("保存") }
+                Button(attrs = {
+                    classes(AppStyles.secondaryButton)
+                    if (!canMoveUp) disabled()
+                    onClick { onMove(1) }
+                }) { Text("上移") }
+                Button(attrs = {
+                    classes(AppStyles.secondaryButton)
+                    if (!canMoveDown) disabled()
+                    onClick { onMove(-1) }
+                }) { Text("下移") }
+                Button(attrs = {
+                    classes(AppStyles.secondaryButton)
+                    onClick { onDelete() }
+                }) { Text("删除") }
             }
         }
     }
@@ -497,10 +702,12 @@ fun MonitorSectionTitle(
 @Composable
 fun MonitorSourcePanel(
     selectedSources: List<String>,
-    customCodes: String,
+    backendTargetSources: List<String>,
+    cooldownSeconds: Int,
     status: String,
     onToggleSource: (String) -> Unit,
-    onCustomCodesChange: (String) -> Unit,
+    onToggleBackendTarget: (String) -> Unit,
+    onCooldownSecondsChange: (Int) -> Unit,
     onRefresh: () -> Unit
 ) {
     Div({ classes(AppStyles.sourcePanel) }) {
@@ -517,6 +724,12 @@ fun MonitorSourcePanel(
         Div({ classes(AppStyles.sourceButtons) }) {
             SourceGroupRow("热榜", monitorSources.filter { it.group == "hot" }, selectedSources, onToggleSource)
             SourceGroupRow("龙虎榜", monitorSources.filter { it.group == "lhb" }, selectedSources, onToggleSource)
+            BackendTargetRow(
+                "其他",
+                listOf("limit_up" to "涨停", "unusual_today" to "异动", "follow_stock" to "关注个股"),
+                backendTargetSources,
+                onToggleBackendTarget
+            )
         }
         Div({ classes(AppStyles.sourceLegend) }) {
             monitorSources.forEach { source ->
@@ -524,11 +737,39 @@ fun MonitorSourcePanel(
             }
         }
         Div({ classes(AppStyles.customCodesRow) }) {
-            Span { Text("自定义") }
-            Input(type = InputType.Text) {
-                value(customCodes)
-                placeholder("多个代码用空格隔开，如 300059 600519")
-                onInput { onCustomCodesChange(it.value) }
+            Span { Text("冷却") }
+            Input(type = InputType.Number) {
+                value(cooldownSeconds.toString())
+                attr("min", "5")
+                attr("max", "3600")
+                attr("step", "5")
+                onInput { event ->
+                    event.value.toString().toIntOrNull()?.let { onCooldownSecondsChange(it) }
+                }
+            }
+            Span { Text("秒") }
+        }
+    }
+}
+
+@Composable
+private fun BackendTargetRow(
+    title: String,
+    sources: List<Pair<String, String>>,
+    selectedSources: List<String>,
+    onToggleSource: (String) -> Unit
+) {
+    Div({ classes(AppStyles.sourceGroupRow) }) {
+        Span({ classes(AppStyles.sourceGroupTitle) }) { Text(title) }
+        Div({ classes(AppStyles.sourceGroupButtons) }) {
+            sources.forEach { (id, name) ->
+                Button(attrs = {
+                    classes(if (selectedSources.contains(id)) AppStyles.sourceButtonOn else AppStyles.sourceButtonOff)
+                    onClick { onToggleSource(id) }
+                }) {
+                    SourceIcon(name)
+                    Text(name)
+                }
             }
         }
     }
@@ -560,7 +801,18 @@ private fun SourceGroupRow(
 @Composable
 fun SourceIcon(sourceName: String) {
     val source = monitorSources.firstOrNull { it.name == sourceName }
-    val icon = source?.icon ?: if (sourceName == "自定义") "自" else sourceName.take(1)
+    val icon = when {
+        sourceName == "涨停" -> "涨"
+        sourceName == "异动" -> "异"
+        sourceName == "关注个股" -> "关"
+        sourceName == "昨日涨停" -> "昨"
+        sourceName == "今日涨停池" -> "今"
+        sourceName.startsWith("连") -> sourceName
+        sourceName.startsWith("异动") || sourceName == "今日异动" -> "异"
+        sourceName == "自定义" -> "自"
+        source != null -> source.icon
+        else -> sourceName.take(1)
+    }
     Span({
         classes(sourceIconClass(sourceName))
         attr("title", sourceName)
@@ -570,18 +822,26 @@ fun SourceIcon(sourceName: String) {
 }
 
 @Composable
-fun SourceIconSet(sourceLabel: String) {
+fun SourceIconSet(sourceLabel: String, target: MonitorTarget? = null) {
     Div({ classes(AppStyles.sourceIconSet) }) {
-        sourceLabel.split(" / ").filter { it.isNotBlank() }.forEach { name ->
+        val labels = sourceLabel.split(" / ").filter { it.isNotBlank() }.toMutableList()
+        val chainIcon = target?.limitUp?.highDays?.let { limitUpChainIcon(it) }
+        if (chainIcon != null && labels.any { it == "今日涨停池" || it == "昨日涨停" }) labels.add(chainIcon)
+        labels.distinct().forEach { name ->
             SourceIcon(name)
         }
     }
 }
 
 @Composable
-private fun StockTable(stocks: List<MonitorStock>) {
+private fun StockTable(
+    stocks: List<MonitorStock>,
+    onFollowStock: (StockTick) -> Unit,
+    onFollowBk: (String) -> Unit
+) {
     val pageSize = 50
     var page by remember { mutableStateOf(1) }
+    var expandedBkCode by remember { mutableStateOf<String?>(null) }
     val totalPages = ((stocks.size + pageSize - 1) / pageSize).coerceAtLeast(1)
     val currentPage = page.coerceIn(1, totalPages)
     val fromIndex = ((currentPage - 1) * pageSize).coerceAtMost(stocks.size)
@@ -599,25 +859,66 @@ private fun StockTable(stocks: List<MonitorStock>) {
                     Th { Text("代码") }
                     Th { Text("名称") }
                     Th { Text("来源") }
+                    Th { Text("板块") }
                     Th { Text("现价") }
                     Th { Text("涨跌幅") }
                     Th { Text("涨停") }
                     Th { Text("跌停") }
+                    Th { Text("首次封板") }
+                    Th { Text("高度") }
+                    Th { Text("开板") }
+                    Th { Text("类型") }
+                    Th { Text("原因") }
                 }
             }
             Tbody {
                 pageStocks.forEach { item ->
                     val stock = item.tick
+                    val limitUp = item.target?.limitUp
+                    val bkCodes = stock.bkCodes()
+                    val expanded = expandedBkCode == stock.code
+                    val visibleBkCodes = if (expanded) bkCodes else bkCodes.take(3)
                     Tr {
-                        Td { Text(stock.code) }
-                        Td { Text(stock.name) }
-                        Td { SourceIconSet(item.source) }
+                        Td {
+                            Button(attrs = {
+                                classes(AppStyles.tableLinkButton)
+                                onClick { onFollowStock(stock) }
+                            }) { Text(stock.code) }
+                        }
+                        Td {
+                            Button(attrs = {
+                                classes(AppStyles.tableLinkButton)
+                                onClick { onFollowStock(stock) }
+                            }) { Text(stock.name) }
+                        }
+                        Td { SourceIconSet(item.source, item.target) }
+                        Td {
+                            Div({ classes(AppStyles.bkChipSet) }) {
+                                visibleBkCodes.forEach { bkCode ->
+                                    Button(attrs = {
+                                        classes(AppStyles.bkChip)
+                                        onClick { onFollowBk(bkCode) }
+                                    }) { Text(bkCode) }
+                                }
+                                if (bkCodes.size > 3) {
+                                    Button(attrs = {
+                                        classes(AppStyles.bkChipMore)
+                                        onClick { expandedBkCode = if (expanded) null else stock.code }
+                                    }) { Text(if (expanded) "收起" else "+${bkCodes.size - 3}") }
+                                }
+                            }
+                        }
                         Td { Text(stock.price.fmt()) }
                         Td({ classes(if (stock.chg >= 0) AppStyles.upText else AppStyles.downText) }) {
                             Text("${stock.chg.fmt()}%")
                         }
                         Td { Text(stock.ztPrice.fmt()) }
                         Td { Text(stock.dtPrice.fmt()) }
+                        Td { Text(formatLimitUpTime(limitUp?.firstLimitUpTime)) }
+                        Td { Text(limitUp?.highDays.orEmpty()) }
+                        Td { Text(limitUp?.openNum?.toString().orEmpty()) }
+                        Td { Text(limitUp?.limitUpType.orEmpty()) }
+                        Td { Text(limitUp?.reasonType.orEmpty()) }
                     }
                 }
             }
@@ -661,6 +962,17 @@ fun AlertList(alerts: List<AlertEvent>) {
                     }
                 }
                 P { Text(alert.content) }
+                if (alert.sources.isNotEmpty()) {
+                    Span({ classes(AppStyles.timeText) }) { Text("来源 ${alert.sources.joinToString(" / ")}") }
+                }
+                alert.replay?.let { replay ->
+                    val replayText = listOf(replay.groupName, replay.reason, replay.time)
+                        .filter { it.isNotBlank() && it != "--:--:--" }
+                        .joinToString(" · ")
+                    if (replayText.isNotBlank()) {
+                        P { Text(replayText) }
+                    }
+                }
                 Span({ classes(AppStyles.timeText) }) { Text(formatTime(alert.time)) }
             }
         }
@@ -799,7 +1111,8 @@ private fun debugLogFromResponse(text: String): String {
 
 private data class MonitorStock(
     val tick: StockTick,
-    val source: String
+    val source: String,
+    val target: MonitorTarget? = null
 )
 
 private data class MonitorSource(
@@ -813,7 +1126,8 @@ private data class MonitorSource(
 
 private data class MonitorSourceLoadResult(
     val sourcesByCode: Map<String, String>,
-    val message: String
+    val message: String,
+    val targetsByCode: Map<String, MonitorTarget> = emptyMap()
 )
 
 private val monitorSources = listOf(
@@ -927,6 +1241,169 @@ private suspend fun loadMonitorSourceMap(selectedSourceIds: List<String>, custom
     return MonitorSourceLoadResult(labelMap, message)
 }
 
+private suspend fun loadMonitorConfig(): MonitorConfig {
+    val response = window.fetch("http://localhost:8080/api/monitor/config").await()
+    val text = response.text().await()
+    if (!response.ok) kotlin.error("monitor config HTTP ${response.status.toInt()}: $text")
+    return json.decodeFromString(text)
+}
+
+private suspend fun loadBackendTargetMap(): MonitorSourceLoadResult {
+    return runCatching {
+        val response = window.fetch("http://localhost:8080/api/monitor/targets").await()
+        val text = response.text().await()
+        if (!response.ok) kotlin.error("monitor targets HTTP ${response.status.toInt()}: $text")
+        val payload = json.decodeFromString<MonitorTargetsResponse>(text)
+        val map = payload.targets.associate { target ->
+            target.code to target.sources.joinToString(" / ")
+        }
+        MonitorSourceLoadResult(map, "后端标的 ${map.size} 只", payload.targets.associateBy { it.code })
+    }.getOrElse {
+        MonitorSourceLoadResult(emptyMap(), "后端标的加载失败")
+    }
+}
+
+private suspend fun loadRecentAlerts(): List<AlertEvent> {
+    val response = window.fetch("http://localhost:8080/api/monitor/alerts?limit=30").await()
+    val text = response.text().await()
+    if (!response.ok) kotlin.error("monitor alerts HTTP ${response.status.toInt()}: $text")
+    return json.decodeFromString(text)
+}
+
+private fun mergeSourceMaps(left: Map<String, String>, right: Map<String, String>): Map<String, String> {
+    val merged = linkedMapOf<String, MutableList<String>>()
+    fun addAll(map: Map<String, String>) {
+        map.forEach { (code, label) ->
+            label.split(" / ").filter { it.isNotBlank() }
+                .forEach { merged.getOrPut(code) { mutableListOf() }.add(it) }
+        }
+    }
+    addAll(left)
+    addAll(right)
+    return merged.mapValues { (_, labels) -> labels.distinct().joinToString(" / ") }
+}
+
+private fun normalizeBackendTargetSources(sources: List<String>): List<String> {
+    if (sources.isEmpty()) return listOf("limit_up")
+    val normalized = linkedSetOf<String>()
+    sources.forEach { source ->
+        when (source) {
+            "limit_up_today", "limit_up_yesterday", "limit_up" -> normalized.add("limit_up")
+            "unusual_today", "follow_stock" -> normalized.add(source)
+        }
+    }
+    return normalized.ifEmpty { linkedSetOf("limit_up") }.toList()
+}
+
+private fun saveMonitorConfigAsync(
+    enabled: Boolean,
+    targetSources: List<String>,
+    customCodes: String,
+    customBkCodes: String,
+    cooldownSeconds: Int,
+    onDone: () -> Unit
+) {
+    kotlinx.coroutines.GlobalScope.promise {
+        saveMonitorConfig(enabled, targetSources, customCodes, customBkCodes, cooldownSeconds)
+    }.then {
+        onDone()
+        null
+    }
+}
+
+private suspend fun saveMonitorConfig(
+    enabled: Boolean,
+    targetSources: List<String>,
+    customCodes: String,
+    customBkCodes: String,
+    cooldownSeconds: Int
+) {
+    val codes = customCodes.split(Regex("\\s+|,|，"))
+        .mapNotNull { normalizeStockCode(it) }
+        .distinct()
+    val bkCodes = customBkCodes.split(Regex("\\s+|,|，"))
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .distinct()
+    val body = json.encodeToString(
+        MonitorConfig(
+            enabled = enabled,
+            targetSources = targetSources.distinct(),
+            customCodes = codes,
+            customBkCodes = bkCodes,
+            cooldownSeconds = cooldownSeconds.coerceIn(5, 3600)
+        )
+    )
+    val options = js("({})")
+    options.method = "POST"
+    options.headers = js("""({"Content-Type":"application/json"})""")
+    options.body = body
+    val response = window.fetch("http://localhost:8080/api/monitor/config", options).await()
+    if (!response.ok) kotlin.error("save monitor config HTTP ${response.status.toInt()}")
+}
+
+private fun updateMonitorFollowAsync(
+    code: String,
+    type: Int,
+    add: Boolean,
+    name: String = "",
+    stickyOnTop: Int = 1,
+    onDone: (String) -> Unit
+) {
+    val normalized = if (type == 1) normalizeStockCode(code).orEmpty() else code.trim().uppercase()
+    if (normalized.isBlank()) {
+        onDone("代码为空")
+        return
+    }
+    kotlinx.coroutines.GlobalScope.promise {
+        updateMonitorFollow(normalized, type, add, name, stickyOnTop)
+        val action = if (add) "已关注" else "已取消"
+        "$action $normalized"
+    }.then {
+        onDone(it)
+        null
+    }.catch {
+        onDone("操作失败: ${it.message ?: "unknown"}")
+        null
+    }
+}
+
+private suspend fun loadMonitorFollows(): List<MonitorFollowItem> {
+    val response = window.fetch("http://localhost:8080/api/monitor/follows").await()
+    val text = response.text().await()
+    if (!response.ok) kotlin.error("monitor follows HTTP ${response.status.toInt()}: $text")
+    return json.decodeFromString(text)
+}
+
+private suspend fun updateMonitorFollow(code: String, type: Int, add: Boolean, name: String, stickyOnTop: Int) {
+    val options = js("({})")
+    options.method = "POST"
+    if (add) {
+        options.headers = js("""({"Content-Type":"application/json"})""")
+        options.body = json.encodeToString(
+            MonitorFollowRequest(
+                code = code,
+                type = type,
+                name = name,
+                stickyOnTop = stickyOnTop
+            )
+        )
+        val response = window.fetch("http://localhost:8080/api/monitor/follow", options).await()
+        val text = response.text().await()
+        if (!response.ok) kotlin.error("follow HTTP ${response.status.toInt()}: $text")
+    } else {
+        val response = window.fetch("http://localhost:8080/api/monitor/follow/remove?code=$code&type=$type", options).await()
+        val text = response.text().await()
+        if (!response.ok) kotlin.error("remove follow HTTP ${response.status.toInt()}: $text")
+    }
+}
+
+private fun postMonitorAction(action: String) {
+    val options = js("({})")
+    options.method = "POST"
+    window.fetch("http://localhost:8080/api/monitor/$action", options)
+}
+
 private suspend fun fetchMonitorSourceText(source: MonitorSource): String {
     return runCatching {
         val response = window.fetch(source.url()).await()
@@ -947,10 +1424,23 @@ private suspend fun fetchMonitorSourceText(source: MonitorSource): String {
 private fun loadMonitorSourceMapAsync(
     selectedSourceIds: List<String>,
     customCodes: String,
+    customBkCodes: String,
+    backendTargetSources: List<String>,
+    cooldownSeconds: Int,
     onResult: (MonitorSourceLoadResult) -> Unit
 ) {
     kotlinx.coroutines.GlobalScope.promise {
-        loadMonitorSourceMap(selectedSourceIds, customCodes)
+        saveMonitorConfig(enabled = true, backendTargetSources, customCodes, customBkCodes, cooldownSeconds)
+        val local = loadMonitorSourceMap(selectedSourceIds, customCodes)
+        val refreshOptions = js("({})")
+        refreshOptions.method = "POST"
+        window.fetch("http://localhost:8080/api/monitor/targets/refresh", refreshOptions).await()
+        val backend = loadBackendTargetMap()
+        MonitorSourceLoadResult(
+            sourcesByCode = mergeSourceMaps(local.sourcesByCode, backend.sourcesByCode),
+            message = listOf(local.message, backend.message).joinToString("；"),
+            targetsByCode = backend.targetsByCode
+        )
     }.then {
         onResult(it)
         null
@@ -980,8 +1470,21 @@ private fun normalizeStockCode(value: String): String? {
     return digits
 }
 
+private fun StockTick.bkCodes(): List<String> =
+    bk.split(',', '，', ' ', ';')
+        .map { it.trim().uppercase() }
+        .filter { it.startsWith("BK") }
+        .distinct()
+
 private fun sourceIconClass(sourceName: String): String {
     return when {
+        sourceName == "昨日涨停" -> AppStyles.limitYesterdayIcon
+        sourceName == "今日涨停池" -> AppStyles.limitTodayIcon
+        sourceName.startsWith("连") -> AppStyles.limitChainIcon
+        sourceName == "涨停" -> AppStyles.limitTodayIcon
+        sourceName == "异动" -> AppStyles.unusualIcon
+        sourceName == "关注个股" -> AppStyles.customIcon
+        sourceName.startsWith("异动") || sourceName == "今日异动" -> AppStyles.unusualIcon
         sourceName.contains("东方财富") -> AppStyles.eastMoneyIcon
         sourceName.contains("同花顺") -> AppStyles.thsIcon
         sourceName.contains("大智慧") -> AppStyles.dzhIcon
@@ -992,6 +1495,17 @@ private fun sourceIconClass(sourceName: String): String {
     }
 }
 
+private fun limitUpChainIcon(highDays: String): String? {
+    if (highDays.isBlank() || highDays.contains("首板")) return null
+    Regex("(\\d+)连板").find(highDays)?.groupValues?.getOrNull(1)?.toIntOrNull()
+        ?.takeIf { it >= 2 }
+        ?.let { return "连$it" }
+    val match = Regex("^(\\d+)天(\\d+)板$").find(highDays) ?: return null
+    val days = match.groupValues[1].toIntOrNull() ?: return null
+    val boards = match.groupValues[2].toIntOrNull() ?: return null
+    return boards.takeIf { it >= 2 && it == days }?.let { "连$it" }
+}
+
 private fun formatTime(time: Long): String {
     val date = js("new Date(time)")
     return date.toLocaleTimeString("zh-CN") as String
@@ -1000,6 +1514,14 @@ private fun formatTime(time: Long): String {
 private fun formatSeconds(time: Long): String {
     val date = js("new Date(time * 1000)")
     return date.toLocaleTimeString("zh-CN") as String
+}
+
+private fun formatLimitUpTime(time: Long?): String {
+    val value = time ?: return ""
+    if (value <= 0L) return ""
+    if (value > 999999L) return formatSeconds(value)
+    val text = value.toString().padStart(6, '0')
+    return "${text.substring(0, 2)}:${text.substring(2, 4)}:${text.substring(4, 6)}"
 }
 
 private fun todayDate(): String {
@@ -1086,6 +1608,7 @@ object AppStyles : StyleSheet() {
 
     val table by style {
         width(100.percent)
+        property("min-width", "1380px")
         property("border-collapse", "collapse")
         fontSize(14.px)
     }
@@ -1152,6 +1675,17 @@ object AppStyles : StyleSheet() {
         display(DisplayStyle.Flex)
         flexDirection(FlexDirection.Column)
         gap(10.px)
+        property("overflow-y", "auto")
+        flex(1)
+        property("min-height", "0")
+    }
+
+    val alertPanel by style {
+        height(260.px)
+        margin(0.px, 0.px, 16.px, 0.px)
+        display(DisplayStyle.Flex)
+        flexDirection(FlexDirection.Column)
+        property("overflow", "hidden")
     }
 
     val alertItem by style {
@@ -1269,6 +1803,47 @@ object AppStyles : StyleSheet() {
         property("flex-wrap", "wrap")
     }
 
+    val tableLinkButton by style {
+        property("appearance", "none")
+        border(0.px, LineStyle.Solid, Color("transparent"))
+        background("transparent")
+        padding(0.px)
+        color(Color("#20242a"))
+        fontSize(14.px)
+        fontWeight("700")
+        property("cursor", "pointer")
+    }
+
+    val bkChipSet by style {
+        display(DisplayStyle.Flex)
+        gap(4.px)
+        property("flex-wrap", "wrap")
+        alignItems(AlignItems.Center)
+    }
+
+    val bkChip by style {
+        button("#f1f5f9", "#334155")
+        padding(4.px, 6.px)
+        fontSize(12.px)
+    }
+
+    val bkChipMore by style {
+        button("#e8eef6", "#1f2937")
+        padding(4.px, 6.px)
+        fontSize(12.px)
+    }
+
+    val followGroupTitle by style {
+        margin(18.px, 0.px, 8.px, 0.px)
+        fontSize(18.px)
+    }
+
+    val followActions by style {
+        display(DisplayStyle.Flex)
+        gap(8.px)
+        property("flex-wrap", "wrap")
+    }
+
     val sourceIcon by style {
         iconBase("#edf2f7", "#344054")
     }
@@ -1295,6 +1870,22 @@ object AppStyles : StyleSheet() {
 
     val customIcon by style {
         iconBase("#475467", "#ffffff")
+    }
+
+    val limitYesterdayIcon by style {
+        iconBase("#7c3aed", "#ffffff")
+    }
+
+    val limitTodayIcon by style {
+        iconBase("#dc2626", "#ffffff")
+    }
+
+    val limitChainIcon by style {
+        iconBase("#b91c1c", "#ffffff")
+    }
+
+    val unusualIcon by style {
+        iconBase("#0f766e", "#ffffff")
     }
 
     val customCodesRow by style {
@@ -1500,8 +2091,10 @@ object AppStyles : StyleSheet() {
         property("display", "inline-flex")
         alignItems(AlignItems.Center)
         justifyContent(JustifyContent.Center)
-        width(20.px)
+        property("min-width", "20px")
         height(20.px)
+        padding(0.px, 4.px)
+        boxSizing("border-box")
         borderRadius(6.px)
         background(backgroundColor)
         color(Color(foregroundColor))

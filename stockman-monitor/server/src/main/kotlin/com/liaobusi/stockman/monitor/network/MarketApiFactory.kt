@@ -50,6 +50,13 @@ object MarketApiFactory {
         ).create(SohuApi::class.java)
     }
 
+    fun thsApi(): ThsApi {
+        return retrofit(
+            baseUrl = "https://data.10jqka.com.cn/",
+            client = defaultOkHttpClient()
+        ).create(ThsApi::class.java)
+    }
+
     private fun retrofit(baseUrl: String, client: OkHttpClient): Retrofit {
         return Retrofit.Builder()
             .baseUrl(baseUrl)
