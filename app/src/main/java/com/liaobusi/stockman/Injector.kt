@@ -246,18 +246,18 @@ object Injector {
         autoRefreshJob?.cancel()
         if (enable) {
             autoRefreshJob = scope.launch(Dispatchers.IO) {
-                async {
-                    while (true) {
-                        while (true) {
-                            if (isTradingTime()) {
-                                StockRepo.getRealTimeBKs()
-                                delay(30 * 1000)
-                            } else {
-                                delay(1000 * 60 * 6)
-                            }
-                        }
-                    }
-                }
+//                async {
+//                    while (true) {
+//                        while (true) {
+//                            if (isTradingTime()) {
+//                                StockRepo.getRealTimeBKs()
+//                                delay(30 * 1000)
+//                            } else {
+//                                delay(1000 * 60 * 6)
+//                            }
+//                        }
+//                    }
+//                }
 
                 if (isTradingTime() && isRealTimeDataSource(context)) {
                     repeat(3) {
@@ -335,7 +335,7 @@ object Injector {
                         while (true) {
                             if (isCallAuctionTime()) {
                                 StockRepo.getRealTimeStocksDFCF()
-                                delay(3000)
+                                delay(10000)
                             } else {
                                 delay(30 * 60 * 1000)
                             }

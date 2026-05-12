@@ -1,8 +1,6 @@
 package com.liaobusi.stockman
 import com.liaobusi.stockman5.R
 
-import android.animation.Animator
-import android.animation.AnimatorListenerAdapter
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -18,30 +16,37 @@ import android.widget.PopupWindow
 import android.widget.TextView
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
+import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CoroutineScope
+import androidx.fragment.app.FragmentManager
 import androidx.recyclerview.widget.DividerItemDecoration
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import com.liaobusi.stockman5.databinding.FragmentFollowPanelBinding
+import com.liaobusi.stockman.db.BK
+import com.liaobusi.stockman5.databinding.FragmentFollowEmbeddedBinding
 import com.liaobusi.stockman5.databinding.ItemFollowPanelBinding
 import com.liaobusi.stockman5.databinding.LayoutFollowPanelPopupBinding
-import com.liaobusi.stockman.db.BK
+import com.liaobusi.stockman.db.openWeb
 import com.liaobusi.stockman.db.Follow
 import com.liaobusi.stockman.db.Stock
-import com.liaobusi.stockman.db.openWeb
+import com.liaobusi.stockman.repo.StockRepo
+import com.liaobusi.stockman.repo.StockResult
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import androidx.core.graphics.toColorInt
 
 class FollowPanelFragment : Fragment() {
 
-    private var _binding: FragmentFollowPanelBinding? = null
-    private val binding: FragmentFollowPanelBinding get() = _binding!!
+    private var embeddedBinding: FragmentFollowEmbeddedBinding? = null
 
-    private var refreshJob: Job? = null
+    private val recycler: RecyclerView get() = embeddedBinding!!.rv
+
+    private val sortManualTv: TextView get() = embeddedBinding!!.sortManualBtn
+    private val sortChgTv: TextView get() = embeddedBinding!!.sortChgBtn
+    private val sortColorTv: TextView get() = embeddedBinding!!.sortColorBtn
+
     private val orderSpKey = "follow_panel_order_v1"
     private val sortSpKey = "follow_panel_sort_mode"
 
@@ -60,12 +65,15 @@ class FollowPanelFragment : Fragment() {
     private fun PanelRow.quoteChg(): Float = stock?.chg ?: bk!!.chg
 
     /**
-     * 自选行数据：附带对应 Follow（含 stickyOnTop、color）
+     * 自选行数据：附带对应 Follow（含 stickyOnTop、color）；
+     * [enriched] 为通过 [StockRepo.strategy4] 补齐的完整 [StockResult]（仅股票自选有效），
+     * 用于嵌入式列表渲染当日行情/涨停复盘/热度/龙虎榜等丰富 UI。
      */
     data class PanelRow(
         val follow: Follow,
         val stock: Stock? = null,
         val bk: BK? = null,
+        val enriched: StockResult? = null,
     ) {
         init {
             require((stock != null) xor (bk != null))
@@ -78,25 +86,26 @@ class FollowPanelFragment : Fragment() {
         }
 
         companion object {
-            fun fromStock(stock: Stock, f: Follow) = PanelRow(follow = f, stock = stock)
+            fun fromStock(stock: Stock, f: Follow, enriched: StockResult? = null) =
+                PanelRow(follow = f, stock = stock, enriched = enriched)
+
             fun fromBk(bkVal: BK, f: Follow) = PanelRow(follow = f, bk = bkVal)
         }
     }
 
     companion object {
-        /** 十色标记（ARGB） */
-        val PALETTE_COLORS: IntArray = intArrayOf(
-            Color.parseColor("#FFD32F2F"),
-            Color.parseColor("#FFFB8C00"),
-            Color.parseColor("#FFFBC02D"),
-            Color.parseColor("#FF1976D2"),
-            Color.parseColor("#FF6A1B9A"),
-            Color.parseColor("#FF43A047"),
-            Color.parseColor("#FFE91E63"),
-            Color.parseColor("#FF00897B"),
-            Color.parseColor("#FF795548"),
-            Color.parseColor("#FF546E7A"),
-        )
+        fun newInstance(): FollowPanelFragment = FollowPanelFragment()
+
+        /**
+         * 将自选股票行转为与复盘列表一致的 [GroupedStockListItem]（仅 type=1 股票）。
+         * 优先使用 [PanelRow.enriched] 中由 [StockRepo.strategy4] 算出的完整结果；
+         * 没有时回退到仅含 stock 的占位 [StockResult]。
+         */
+        fun panelStockRowsToGroupedItems(rows: List<PanelRow>): List<GroupedStockListItem> =
+            rows.filter { it.stock != null }.map { pr ->
+                val base = pr.enriched ?: StockResult(stock = pr.stock!!)
+                GroupedStockListItem.Row(base.copy(follow = pr.follow))
+            }
 
         fun circleBg(colorArgb: Int): GradientDrawable =
             GradientDrawable().apply {
@@ -106,45 +115,8 @@ class FollowPanelFragment : Fragment() {
             }
     }
 
-    fun isShowing(): Boolean = _binding?.root?.visibility == View.VISIBLE
-
-    fun toggle() {
-        if (isShowing()) hide() else show()
-    }
-
-    fun show() {
-        if (_binding == null) return
-        if (binding.root.visibility == View.VISIBLE) return
-        refreshSortChipUi()
-        binding.root.visibility = View.VISIBLE
-        binding.container.post {
-            val h = binding.container.height.toFloat().takeIf { it > 0 } ?: 0f
-            binding.mask.alpha = 0f
-            binding.container.translationY = -h
-            binding.mask.animate().alpha(1f).setDuration(180).start()
-            binding.container.animate().translationY(0f).setDuration(220).start()
-        }
-        loadOnce()
-        startDbRefreshLoop()
-    }
-
-    fun hide() {
-        if (_binding == null) return
-        if (binding.root.visibility != View.VISIBLE) return
-        refreshJob?.cancel()
-        refreshJob = null
-        val h = binding.container.height.toFloat()
-        binding.mask.animate().alpha(0f).setDuration(160).start()
-        binding.container.animate()
-            .translationY(-h)
-            .setDuration(200)
-            .setListener(object : AnimatorListenerAdapter() {
-                override fun onAnimationEnd(animation: Animator) {
-                    binding.container.animate().setListener(null)
-                    binding.root.visibility = View.GONE
-                }
-            })
-            .start()
+    fun isShowing(): Boolean {
+        return isAdded && embeddedBinding != null
     }
 
     override fun onCreateView(
@@ -152,77 +124,128 @@ class FollowPanelFragment : Fragment() {
         container: ViewGroup?,
         savedInstanceState: Bundle?,
     ): View {
-        _binding = FragmentFollowPanelBinding.inflate(inflater, container, false)
-
-        val adapter = FollowAdapter(fragment = this)
-
-        binding.rv.apply {
+        embeddedBinding = FragmentFollowEmbeddedBinding.inflate(inflater, container, false)
+        recycler.apply {
             layoutManager = LinearLayoutManager(context)
-            addItemDecoration(DividerItemDecoration(context, DividerItemDecoration.VERTICAL))
-            this.adapter = adapter
+            adapter = GroupedStockResultAdapter(groupedStockResultAdapterHost())
         }
-
-        binding.sortManualBtn.setOnClickListener { applySortChoice(FollowSortMode.MANUAL) }
-        binding.sortChgBtn.setOnClickListener { applySortChoice(FollowSortMode.BY_CHG_DESC) }
-        binding.sortColorBtn.setOnClickListener { applySortChoice(FollowSortMode.BY_COLOR_THEN_CHG) }
+        embeddedBinding!!.sortManualBtn.setOnClickListener { applySortChoice(FollowSortMode.MANUAL) }
+        embeddedBinding!!.sortChgBtn.setOnClickListener { applySortChoice(FollowSortMode.BY_CHG_DESC) }
+        embeddedBinding!!.sortColorBtn.setOnClickListener { applySortChoice(FollowSortMode.BY_COLOR_THEN_CHG) }
         refreshSortChipUi()
+        return embeddedBinding!!.root
+    }
 
-        binding.mask.setOnClickListener { hide() }
-        binding.root.setOnClickListener { hide() }
-        binding.container.setOnClickListener { }
+    override fun onResume() {
+        super.onResume()
+        refreshSortChipUi()
+        if (!isHidden) loadOnce()
+    }
 
-        return binding.root
+    override fun onPause() {
+        super.onPause()
+    }
+
+    override fun onHiddenChanged(hidden: Boolean) {
+        super.onHiddenChanged(hidden)
+        if (!hidden) {
+            refreshSortChipUi()
+            loadOnce()
+        }
     }
 
     override fun onDestroyView() {
-        refreshJob?.cancel()
-        refreshJob = null
-        _binding = null
+        embeddedBinding = null
         super.onDestroyView()
     }
 
-    private fun loadOnce() {
-        if (_binding == null) return
-        viewLifecycleOwner.lifecycleScope.launch {
-            val list = withContext(Dispatchers.IO) { loadFollowList() }
-            if (!isAdded || _binding == null) return@launch
-            (binding.rv.adapter as? FollowAdapter)?.setData(list)
+    private fun groupedStockResultAdapterHost(): GroupedStockResultAdapter.Host =
+        object : GroupedStockResultAdapter.Host {
+            override val context: android.content.Context get() = requireContext()
+            override val lifecycleOwner: LifecycleOwner get() = viewLifecycleOwner
+            override val coroutineScope: CoroutineScope get() = viewLifecycleOwner.lifecycleScope
+            override val fragmentManager: FragmentManager get() = parentFragmentManager
+            override fun endTimeYmdText(): String {
+                val act = activity
+                return if (act is Strategy4Activity) act.watchEndTimeYmdText()
+                else today().toString()
+            }
+
+            // FollowPanelFragment 仅负责“切到页时 loadOnce”，定时刷新交给 adapter 批量刷新
+            override val enableAdapterAutoRefresh: Boolean = true
+            override val enableAdapterBatchAutoRefresh: Boolean = true
+
+            // 自选模式下显示"标色"按钮和调色盘
+            override val showMarkerColorPalette: Boolean = true
+
+            override fun onStockPinned(stock: Stock, toTop: Boolean) {
+                pinFollowedStock(stock.code, toTop)
+            }
+
+            override fun onStockFollowChanged(stock: Stock) {
+                // follow 变化（关注/取关/标色）后重新跑 loadFollowList，避免 strategy4 的 enriched 数据飘
+                loadOnce()
+            }
+        }
+
+    /** 把 code 对应的自选股移到列表顶部 / 底部并把顺序持久化到 SharedPreferences。 */
+    private fun pinFollowedStock(code: String, toTop: Boolean) {
+        val targetKey = keyOf(1, code)
+        forceManualSort()
+        val gAdapter = recycler.adapter as? GroupedStockResultAdapter
+        val keys = gAdapter?.getStockList()?.map { keyOf(1, it.code) } ?: readOrder()
+        val newOrder = if (toTop) {
+            listOf(targetKey) + keys.filter { it != targetKey }
+        } else {
+            keys.filter { it != targetKey } + listOf(targetKey)
+        }
+        Injector.sp.edit().putString(orderSpKey, newOrder.distinct().joinToString(",")).apply()
+    }
+
+    /** 嵌入式且无板块自选时复用 [GroupedStockResultAdapter]；否则保持紧凑 [FollowAdapter]。 */
+    private fun bindRecyclerAdapterForList(list: List<PanelRow>) {
+        val hasBk = list.any { it.bk != null }
+        if (!hasBk) {
+            val items = panelStockRowsToGroupedItems(list)
+            when (val a = recycler.adapter) {
+                is GroupedStockResultAdapter -> a.setData(items, 1)
+                else -> {
+                    recycler.adapter = GroupedStockResultAdapter(groupedStockResultAdapterHost()).also {
+                        it.setData(items, 1)
+                    }
+                }
+            }
+        } else {
+            when (val a = recycler.adapter) {
+                is FollowAdapter -> a.setData(list)
+                else -> {
+                    recycler.adapter = FollowAdapter(this).also { it.setData(list) }
+                }
+            }
         }
     }
 
-    /** 面板打开期间定时从本地 Room 读自选与行情快照，不写网络。 */
-    private fun startDbRefreshLoop() {
-
-        if (!isTradingTime()) return
-        refreshJob?.cancel()
-        refreshJob = viewLifecycleOwner.lifecycleScope.launch(Dispatchers.IO) {
-            if (!isTradingDay()) return@launch
-            while (isActive) {
-                if (!isShowing()) {
-                    delay(8000)
-                    continue
-                }
-                val list = loadFollowList()
-                withContext(Dispatchers.Main) {
-                    if (!isAdded || _binding == null) return@withContext
-                    (binding.rv.adapter as? FollowAdapter)?.updateQuotes(list)
-                }
-                delay(1000)
-            }
+    private fun loadOnce() {
+        if (embeddedBinding == null) return
+        viewLifecycleOwner.lifecycleScope.launch {
+            val list = withContext(Dispatchers.IO) { loadFollowList() }
+            if (!isAdded || embeddedBinding == null) return@launch
+            bindRecyclerAdapterForList(list)
         }
     }
 
     fun keyOf(type: Int, code: String): String = "${type}:${code}"
 
-    private fun loadFollowList(): List<PanelRow> {
+    private suspend fun loadFollowList(): List<PanelRow> {
         val follows = Injector.appDatabase.followDao().getFollows()
         val stockCodes = follows.filter { it.type == 1 }.map { it.code }
         val bkCodes = follows.filter { it.type == 2 }.map { it.code }
 
-        val stockMap =
-            if (stockCodes.isNotEmpty()) Injector.appDatabase.stockDao().getStockByCodes(stockCodes)
-                .associateBy { it.code }
-            else emptyMap()
+        val stockList =
+            if (stockCodes.isNotEmpty()) Injector.appDatabase.stockDao()
+                .getStockByCodes(stockCodes)
+            else emptyList()
+        val stockMap = stockList.associateBy { it.code }
 
         val bkMap =
             if (bkCodes.isNotEmpty()) Injector.appDatabase.bkDao().getAllBK()
@@ -230,11 +253,36 @@ class FollowPanelFragment : Fragment() {
                 .associateBy { it.code }
             else emptyMap()
 
+        // 仅在嵌入式纯股票自选时调 strategy4 把当日行情/涨停复盘/热度/龙虎榜等字段补齐；
+        // 用宽松到几乎不过滤的市值与"低于均线天数"参数，避免 strategy4 的过滤剔除掉用户的自选标的。
+        val needEnrich = bkCodes.isEmpty() && stockList.isNotEmpty()
+        val enrichedMap: Map<String, StockResult> =
+            if (needEnrich) {
+                StockRepo.strategy4(
+                    startMarketTime = 0,
+                    endMarketTime = 99999999,
+                    lowMarketValue = 0.0,
+                    highMarketValue = Double.MAX_VALUE,
+                    endTime = today(),
+                    allowBelowCount = Int.MAX_VALUE,
+                    divergeRate = 1.0,
+                    bkList = null,
+                    stockList = stockList,
+                ).stockResults
+                    .filter { !it.isGroupHeader }
+                    .associateBy { it.stock.code }
+            } else {
+                emptyMap()
+            }
+
         val itemsByKey = mutableMapOf<String, PanelRow>()
         for (f in follows) {
             val pk = keyOf(f.type, f.code)
             when (f.type) {
-                1 -> stockMap[f.code]?.let { itemsByKey[pk] = PanelRow.fromStock(it, f) }
+                1 -> stockMap[f.code]?.let {
+                    itemsByKey[pk] = PanelRow.fromStock(it, f, enriched = enrichedMap[f.code])
+                }
+
                 2 -> bkMap[f.code]?.let { itemsByKey[pk] = PanelRow.fromBk(it, f) }
             }
         }
@@ -279,8 +327,8 @@ class FollowPanelFragment : Fragment() {
     }
 
     private fun refreshSortChipUi() {
-        if (_binding == null) return
-        val ctx = binding.root.context
+        if (embeddedBinding == null) return
+        val ctx = embeddedBinding!!.root.context
         val idle = ContextCompat.getColor(ctx, R.color.yd_secondary)
         fun styleChip(tv: TextView, selected: Boolean) {
             tv.setBackgroundResource(
@@ -291,9 +339,9 @@ class FollowPanelFragment : Fragment() {
         }
 
         val mode = readSortMode()
-        styleChip(binding.sortManualBtn, mode == FollowSortMode.MANUAL)
-        styleChip(binding.sortChgBtn, mode == FollowSortMode.BY_CHG_DESC)
-        styleChip(binding.sortColorBtn, mode == FollowSortMode.BY_COLOR_THEN_CHG)
+        styleChip(sortManualTv, mode == FollowSortMode.MANUAL)
+        styleChip(sortChgTv, mode == FollowSortMode.BY_CHG_DESC)
+        styleChip(sortColorTv, mode == FollowSortMode.BY_COLOR_THEN_CHG)
     }
 
     private fun applySortMode(manualOrdered: List<PanelRow>): List<PanelRow> {
@@ -508,6 +556,8 @@ class FollowPanelFragment : Fragment() {
                     pop.palettePick8,
                     pop.palettePick9,
                     pop.palettePick10,
+                    pop.palettePick11,
+                    pop.palettePick12,
                 )
                 PALETTE_COLORS.forEachIndexed { ix, argb ->
                     picks[ix].background = FollowPanelFragment.circleBg(argb)

@@ -1,13 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    android:layout_width="match_parent"
+    android:layout_width="wrap_content"
     android:layout_height="wrap_content"
     android:background="#333"
+    android:minWidth="220dp"
     android:orientation="vertical">
 
     <TextView
         android:id="@+id/followBtn"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:paddingHorizontal="20dp"
         android:paddingVertical="10dp"
@@ -17,7 +18,7 @@
 
     <TextView
         android:id="@+id/stickyOnTopBtn"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:paddingHorizontal="20dp"
         android:paddingVertical="10dp"
@@ -25,11 +26,150 @@
         android:textColor="#fff"
         android:textSize="18sp" />
 
+    <TextView
+        android:id="@+id/stickyOnBottomBtn"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingHorizontal="20dp"
+        android:paddingVertical="10dp"
+        android:text="置底"
+        android:textColor="#fff"
+        android:textSize="18sp" />
+
+    <TextView
+        android:id="@+id/markColorBtn"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingHorizontal="20dp"
+        android:paddingVertical="10dp"
+        android:text="标色"
+        android:textColor="#fff"
+        android:textSize="18sp"
+        android:visibility="gone" />
+
+    <LinearLayout
+        android:id="@+id/colorPaletteRow"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:paddingHorizontal="12dp"
+        android:paddingVertical="12dp"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:gravity="center"
+            android:orientation="horizontal">
+
+            <View
+                android:id="@+id/palettePick1"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+
+            <View
+                android:id="@+id/palettePick2"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+
+            <View
+                android:id="@+id/palettePick3"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+
+            <View
+                android:id="@+id/palettePick4"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:orientation="horizontal">
+
+            <View
+                android:id="@+id/palettePick5"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+
+            <View
+                android:id="@+id/palettePick6"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+
+            <View
+                android:id="@+id/palettePick7"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+
+            <View
+                android:id="@+id/palettePick8"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:orientation="horizontal">
+
+            <View
+                android:id="@+id/palettePick9"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+
+            <View
+                android:id="@+id/palettePick10"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+
+            <View
+                android:id="@+id/palettePick11"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+
+            <View
+                android:id="@+id/palettePick12"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+        </LinearLayout>
+    </LinearLayout>
+
 
     <TextView
         android:visibility="gone"
         android:id="@+id/expandReasonBtn"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:paddingHorizontal="20dp"
         android:paddingVertical="10dp"
@@ -40,7 +180,7 @@
     <TextView
         android:visibility="gone"
         android:id="@+id/expandPOPReasonBtn"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:paddingHorizontal="20dp"
         android:paddingVertical="10dp"
@@ -51,7 +191,7 @@
 
     <TextView
         android:id="@+id/relatedConceptBtn"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:paddingHorizontal="20dp"
         android:paddingVertical="10dp"
@@ -61,7 +201,7 @@
 
     <TextView
         android:id="@+id/dragonTigerRankBtn"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:paddingHorizontal="20dp"
         android:paddingVertical="10dp"
@@ -71,7 +211,7 @@
 
     <TextView
         android:id="@+id/joinBtn"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:paddingHorizontal="20dp"
         android:paddingVertical="10dp"
@@ -82,7 +222,7 @@
 
     <TextView
         android:id="@+id/ydHistoryBtn"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:paddingHorizontal="20dp"
         android:paddingVertical="10dp"
@@ -92,7 +232,7 @@
 
     <TextView
         android:id="@+id/strongLinkStocksBtn"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:paddingHorizontal="20dp"
         android:paddingVertical="10dp"
@@ -102,7 +242,7 @@
 
     <TextView
         android:id="@+id/stockFitRankingBtn"
-        android:layout_width="wrap_content"
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:paddingHorizontal="20dp"
         android:paddingVertical="10dp"

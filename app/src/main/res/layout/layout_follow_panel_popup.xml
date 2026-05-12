@@ -79,13 +79,6 @@
                 android:layout_height="28dp"
                 android:layout_marginHorizontal="8dp"
                 android:foreground="?android:attr/selectableItemBackgroundBorderless" />
-
-            <View
-                android:id="@+id/palettePick5"
-                android:layout_width="28dp"
-                android:layout_height="28dp"
-                android:layout_marginHorizontal="8dp"
-                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
         </LinearLayout>
 
         <LinearLayout
@@ -94,6 +87,13 @@
             android:layout_marginTop="8dp"
             android:gravity="center"
             android:orientation="horizontal">
+
+            <View
+                android:id="@+id/palettePick5"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
 
             <View
                 android:id="@+id/palettePick6"
@@ -115,6 +115,14 @@
                 android:layout_height="28dp"
                 android:layout_marginHorizontal="8dp"
                 android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:gravity="center"
+            android:orientation="horizontal">
 
             <View
                 android:id="@+id/palettePick9"
@@ -125,6 +133,20 @@
 
             <View
                 android:id="@+id/palettePick10"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+
+            <View
+                android:id="@+id/palettePick11"
+                android:layout_width="28dp"
+                android:layout_height="28dp"
+                android:layout_marginHorizontal="8dp"
+                android:foreground="?android:attr/selectableItemBackgroundBorderless" />
+
+            <View
+                android:id="@+id/palettePick12"
                 android:layout_width="28dp"
                 android:layout_height="28dp"
                 android:layout_marginHorizontal="8dp"

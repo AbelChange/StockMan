@@ -113,6 +113,7 @@ interface StockService {
     @GET("https://43.push2.eastmoney.com/api/qt/clist/get?pn=1&pz=10000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&wbp2u=|0|0|0|web&fid=f3&fs=m:90+t:2+f:!50,m:90+t:3+f:!50&fields=f1,f2,f3,f4,f5,f6,f7,f8,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f24,f25,f22,f33,f11,f62,f152,f124,f107,f104,f105,f297&pn=1")
     suspend fun getRealTimeBK(): EMResponse
 
+    //fs s:2 一级行业  s:4二级行业 s:8三级行业
     @GET("https://43.push2.eastmoney.com/api/qt/clist/get?pz=10000&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&wbp2u=|0|0|0|web&fid=f3&fs=m:90+t:2+f:!50&fields=f2,f3,f7,f8,f12,f14,f15,f16,f17,f18,f20,f21,f297")
     suspend fun getRealTimeTradeBK(@Query("pn") pn: Int = 1): EMResponse
 

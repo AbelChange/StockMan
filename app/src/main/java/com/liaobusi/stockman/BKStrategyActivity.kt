@@ -102,7 +102,7 @@ class BKStrategyActivity : AppCompatActivity() {
                 range = 5,
                 endTime = endTime,
                 averageDay = 5,
-                allowBelowCount = if (binding.onlyActiveRateCb.isChecked) 5 else 0,
+                allowBelowCount = if (!binding.strictMACb.isChecked) 5 else 0,
                 divergeRate = 0.0 / 100,
             )
             updateUI(param)
@@ -121,7 +121,7 @@ class BKStrategyActivity : AppCompatActivity() {
                 range = 10,
                 endTime = endTime,
                 averageDay = 10,
-                allowBelowCount = if (binding.onlyActiveRateCb.isChecked) 10 else 0,
+                allowBelowCount = if (!binding.strictMACb.isChecked) 10 else 0,
                 divergeRate = 0.0 / 100
             )
             updateUI(param)
@@ -140,7 +140,7 @@ class BKStrategyActivity : AppCompatActivity() {
                 range = 20,
                 endTime = endTime,
                 averageDay = 20,
-                allowBelowCount = if (binding.onlyActiveRateCb.isChecked) 20 else 0,
+                allowBelowCount = if (!binding.strictMACb.isChecked) 20 else 0,
                 divergeRate = 0.0 / 100
             )
             updateUI(param)
@@ -159,7 +159,7 @@ class BKStrategyActivity : AppCompatActivity() {
                 range = 30,
                 endTime = endTime,
                 averageDay = 30,
-                allowBelowCount = if (binding.onlyActiveRateCb.isChecked) 30 else 0,
+                allowBelowCount = if (!binding.strictMACb.isChecked) 30 else 0,
                 divergeRate = 0.0 / 100
             )
             updateUI(param)
@@ -178,7 +178,7 @@ class BKStrategyActivity : AppCompatActivity() {
                 range = 60,
                 endTime = endTime,
                 averageDay = 60,
-                allowBelowCount = if (binding.onlyActiveRateCb.isChecked) 60 else 0,
+                allowBelowCount = if (!binding.strictMACb.isChecked) 60 else 0,
                 divergeRate = 0.0 / 100
             )
             updateUI(param)
@@ -226,7 +226,7 @@ class BKStrategyActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
 
-            if (binding.onlyActiveRateCb.isChecked) {
+            if (!binding.strictMACb.isChecked) {
                 binding.divergeRateTv.setText("0.0")
                 binding.allowBelowCountTv.setText(timeRange.toString())
             }

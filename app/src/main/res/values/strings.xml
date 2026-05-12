@@ -36,6 +36,16 @@
     <string name="follow_sort_chg">涨跌</string>
     <string name="follow_sort_color">分组色</string>
 
+    <string name="strategy4_screen_title">均线强势</string>
+    <string name="strategy4_mode_replay">复盘</string>
+    <string name="strategy4_mode_watch">盯盘</string>
+    <string name="strategy4_fab_mode_switch">在复盘与盯盘之间切换</string>
+    <string name="strategy4_tab_sector">板块</string>
+    <string name="strategy4_tab_limit_up_pool">涨停池</string>
+    <string name="strategy4_tab_unusual">异动</string>
+    <string name="strategy4_bk_sort">排序</string>
+    <string name="strategy4_refresh">刷新</string>
+
     <string name="related_stocks_empty">该时间段内暂无关联股票</string>
 
     <string name="stock_pair_fit_title">双股走势拟合（测试）</string>

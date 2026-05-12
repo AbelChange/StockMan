@@ -341,9 +341,7 @@ val HistoryStock.longUpShadow: Boolean
     entities = [Stock::class, HistoryStock::class, BK::class, HistoryBK::class, BKStock::class, Follow::class, GDRS::class, Hide::class, AnalysisBean::class, ZTReplayBean::class, DIYBk::class, PopularityRank::class, DragonTigerRank::class, ExpectHot::class, UnusualActionHistory::class, StockLinkage::class],
     version = 37,
     autoMigrations = [
-        AutoMigration(from = 32, to = 33),
-        AutoMigration(from = 33, to = 34),
-        AutoMigration(from = 36, to = 37),
+
     ]
 )
 abstract class AppDatabase : RoomDatabase() {

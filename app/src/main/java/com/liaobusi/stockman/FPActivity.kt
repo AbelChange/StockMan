@@ -1,9 +1,6 @@
 package com.liaobusi.stockman
 import com.liaobusi.stockman5.R
 
-import android.animation.Animator
-import android.animation.AnimatorListenerAdapter
-import android.animation.ValueAnimator
 import android.graphics.Color
 import android.os.Build
 import android.os.Bundle
@@ -31,7 +28,6 @@ import androidx.recyclerview.widget.RecyclerView
 import com.liaobusi.stockman5.databinding.ActivityFpactivityBinding
 import com.liaobusi.stockman5.databinding.ActivityHomeBinding
 import com.liaobusi.stockman5.databinding.ItemBkBinding
-import com.liaobusi.stockman5.databinding.ItemStock2Binding
 import com.liaobusi.stockman5.databinding.ItemStockBinding
 import com.liaobusi.stockman5.databinding.LayoutPopupWindow2Binding
 import com.liaobusi.stockman5.databinding.LayoutPopupWindowBinding
@@ -73,6 +69,53 @@ import kotlin.math.min
 class FPActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityFpactivityBinding
+
+    private val bkHost = object : BKResultAdapter.Host {
+        override val lifecycleOwner = this@FPActivity
+        override val coroutineScope = lifecycleScope
+
+        override fun isZtMode(): Boolean = binding.ztModeCb.isChecked
+        override fun isZtsSort(): Boolean = binding.ztsCb.isChecked
+
+        override fun endTimeYmdText(): String = binding.endTimeTv.text.toString()
+
+        override fun onBkSelected(code: String) {
+            selectBK(code)
+        }
+    }
+
+    private val groupedStockHost = object : GroupedStockResultAdapter.Host {
+        override val context = this@FPActivity
+        override val lifecycleOwner = this@FPActivity
+        override val coroutineScope = lifecycleScope
+        override val fragmentManager = supportFragmentManager
+
+        override fun endTimeYmdText(): String =
+            binding.endTimeTv.editableText?.toString().orEmpty()
+
+        // 复盘页本身没有额外定时刷新逻辑，交给 adapter 做可见行刷新
+        override val enableAdapterAutoRefresh: Boolean = true
+        override val enableAdapterBatchAutoRefresh: Boolean = false
+        override val showMarkerColorPalette: Boolean = false
+
+        // FPActivity 中隐藏 item_stock 的部分控件
+        override val hideStockRowLabel: Boolean = true
+        override val hideDragonTigerTags: Boolean = true
+    }
+
+    private fun toGroupedItems(list: List<StockResult>): List<GroupedStockListItem> {
+        return list.map { r ->
+            if (r.isGroupHeader) {
+                GroupedStockListItem.Header(
+                    groupColor = r.groupColor,
+                    ztReplay = r.ztReplay,
+                    ydDetails = r.ydDetails,
+                )
+            } else {
+                GroupedStockListItem.Row(r)
+            }
+        }
+    }
 
 
     override fun onCreateOptionsMenu(menu: Menu?): Boolean {
@@ -163,8 +206,8 @@ class FPActivity : AppCompatActivity() {
 
         binding.bksRV.layoutManager = LinearLayoutManager(this)
         binding.stockRv.layoutManager = LinearLayoutManager(this)
-        binding.stockRv.adapter = StockAdapter()
-        binding.bksRV.adapter = BKsAdapter()
+        binding.stockRv.adapter = GroupedStockResultAdapter(groupedStockHost)
+        binding.bksRV.adapter = BKResultAdapter(bkHost)
 
         binding.chooseStockBtn.callOnClick()
         lifecycleScope.launch(Dispatchers.IO) {
@@ -404,9 +447,9 @@ class FPActivity : AppCompatActivity() {
                 }
             }
 
-            (binding.stockRv.adapter as StockAdapter).setData(
-                r.toMutableList(),
-                if (binding.popularitySortCb.isChecked) 1 else if (binding.thsPopularitySortCb.isChecked) 2 else if (binding.tgbPopularitySortCb.isChecked) 3 else if (binding.dzhPopularitySortCb.isChecked) 4 else 0
+            (binding.stockRv.adapter as GroupedStockResultAdapter).setData(
+                toGroupedItems(r),
+                if (binding.popularitySortCb.isChecked) 1 else if (binding.thsPopularitySortCb.isChecked) 2 else if (binding.tgbPopularitySortCb.isChecked) 3 else if (binding.dzhPopularitySortCb.isChecked) 4 else 0,
             )
         }
     }
@@ -529,835 +572,8 @@ class FPActivity : AppCompatActivity() {
                 })
             }
 
-            (binding.bksRV.adapter as BKsAdapter).setData(r.toMutableList())
+            (binding.bksRV.adapter as BKResultAdapter).setData(r)
         }
     }
-
-    inner class BKsAdapter : RecyclerView.Adapter<BKsAdapter.VH>() {
-
-        private val data = mutableListOf<BKResult>()
-
-        fun setData(data: MutableList<BKResult>) {
-
-            this.data.clear()
-            this.data.addAll(data)
-            notifyDataSetChanged()
-            selectedItem = data.firstOrNull()
-            if (selectedItem != null)
-                selectBK(selectedItem!!.bk.code)
-
-        }
-
-        private var selectedItem: BKResult? = null
-        private var job: Job? = null
-
-        override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
-            super.onDetachedFromRecyclerView(recyclerView)
-            job?.cancel()
-        }
-
-        override fun onAttachedToRecyclerView(recyclerView: RecyclerView) {
-            super.onAttachedToRecyclerView(recyclerView)
-            job = lifecycleScope.launch(Dispatchers.IO) {
-                while (true) {
-                    delay(1000)
-                    if (recyclerView.scrollState != RecyclerView.SCROLL_STATE_IDLE || recyclerView.isLayoutRequested) {
-                        continue
-                    }
-                    val lm = recyclerView.layoutManager as LinearLayoutManager
-                    val firstPos = lm.findFirstVisibleItemPosition()
-                    val lastPos = lm.findLastVisibleItemPosition()
-                    if (firstPos == RecyclerView.NO_POSITION || lastPos == RecyclerView.NO_POSITION) {
-                        continue
-                    }
-
-                    for (i in firstPos until lastPos + 1) {
-                        val result = data[i]
-                        if (result.currentDayHistory != null) {
-                            val s =
-                                Injector.appDatabase.bkDao().getBKByCode(result.bk.code)
-                            val cur = Injector.appDatabase.historyBKDao().getHistoryByDate3(
-                                result.bk.code,
-                                result.currentDayHistory!!.date
-                            )
-                            val next =
-                                if (result.nextDayHistory != null) Injector.appDatabase.historyBKDao()
-                                    .getHistoryByDate3(
-                                        result.bk.code,
-                                        result.nextDayHistory!!.date
-                                    ) else null
-                            if (cur?.chg != result.currentDayHistory!!.chg || next?.chg != result.nextDayHistory?.chg) {
-                                data[i] = result.copy(
-                                    bk = s!!,
-                                    currentDayHistory = cur,
-                                    nextDayHistory = next
-                                )
-                                launch(Dispatchers.Main) {
-                                    notifyItemChanged(i)
-                                }
-
-                            }
-                        }
-                    }
-
-                }
-            }
-        }
-
-        inner class VH(private val itemBinding: ItemBkBinding) :
-            RecyclerView.ViewHolder(itemBinding.root) {
-
-            @RequiresApi(Build.VERSION_CODES.O)
-            fun bind(result: BKResult, position: Int) {
-                itemBinding.apply {
-
-                    if (result.expectHotList?.isNotEmpty() == true) {
-                        hotIv.visibility = View.VISIBLE
-                        val sb = StringBuilder().apply {
-                            result.expectHotList!!.forEach {
-                                this.append("${it.summary}\n\n")
-                            }
-
-                        }
-                        summary.text = sb.trimEnd().toString()
-                    } else {
-                        hotIv.visibility = View.GONE
-                        summary.text = ""
-                    }
-
-                    if (result.expandSumary && summary.text.isNotEmpty()) {
-                        summary.visibility = View.VISIBLE
-                    } else {
-                        summary.visibility = View.GONE
-                    }
-
-
-                    if (selectedItem?.bk?.code == result.bk.code) {
-                        this.root.setBackgroundColor(0xffffff00.toInt())
-                    } else {
-                        this.root.setBackgroundColor(0xffffffff.toInt())
-                    }
-
-
-
-
-                    if (result.follow) {
-                        this.root.setBackgroundColor(0x33333333)
-                    }
-
-                    if (result.hide) {
-                        this.root.setBackgroundColor(0xffB0E0E6.toInt())
-                    }
-
-                    this.bkName.text = result.bk.name
-
-
-                    var ev: MotionEvent? = null
-                    root.setOnTouchListener { view, motionEvent ->
-                        if (motionEvent.action == MotionEvent.ACTION_DOWN) {
-                            ev = motionEvent
-                        }
-                        return@setOnTouchListener false
-                    }
-
-                    if (result.currentDayHistory != null) {
-                        result.currentDayHistory!!.apply {
-                            currentChg.setTextColor(color)
-                            currentChg.text = chg.toString()
-                            if (isShowCurrentChg(binding.root.context)) {
-                                currentChg.visibility = View.VISIBLE
-                            } else {
-                                currentChg.visibility = View.GONE
-                            }
-                        }
-                    }
-
-                    if (result.nextDayHistory != null) {
-                        result.nextDayHistory!!.apply {
-                            nextDayChg.setTextColor(color)
-                            nextDayChg.text = chg.toString()
-                            nextDayChg.visibility = View.VISIBLE
-                        }
-                    } else {
-                        nextDayChg.visibility = View.GONE
-                    }
-
-
-                    flagTv.visibility = View.INVISIBLE
-                    if (binding.ztModeCb.isChecked || binding.ztsCb.isChecked) {
-                        if (result.ztCount > 0) {
-                            flagTv.setBackgroundColor(
-                                Color.valueOf(
-                                    1f,
-                                    0f,
-                                    0f,
-                                    result.ztCount / 15f
-                                ).toArgb()
-                            )
-                            flagTv.visibility = View.VISIBLE
-                            flagTv.text = result.ztCount.toString()
-                        }
-                    } else {
-                        if (result.highestLianBanCount > 0) {
-                            flagTv.setBackgroundColor(
-                                Color.valueOf(
-                                    1f,
-                                    0f,
-                                    0f,
-                                    result.highestLianBanCount / 15f
-                                ).toArgb()
-                            )
-                            flagTv.visibility = View.VISIBLE
-                            flagTv.text = result.highestLianBanCount.toString()
-                        }
-                    }
-
-
-
-
-                    root.setOnLongClickListener {
-
-                        val b =
-                            LayoutPopupWindowBinding.inflate(LayoutInflater.from(it.context))
-
-
-                        val pw = PopupWindow(
-                            b.root,
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                            true
-                        )
-
-                        b.apply {
-                            if (result.follow) {
-                                followBtn.text = "取消关注"
-                            }
-                            if (result.hide) {
-                                hideBtn.text = "取消隐藏"
-                            }
-
-                            if (result.expandSumary) {
-                                expandBtn.text = "折叠详情"
-                            } else {
-                                expandBtn.text = "展开详情"
-                            }
-
-
-                            val codes = result.bk.code
-
-                            expandBtn.setOnClickListener {
-                                val index = data.indexOf(result)
-                                result.expandSumary = !result.expandSumary
-                                notifyItemChanged(index)
-                                pw.dismiss()
-                            }
-
-                            ztrcBtn.setOnClickListener {
-                                Strategy2Activity.openZTRCStrategy(
-                                    this@FPActivity,
-                                    codes,
-                                    binding.endTimeTv.text.toString()
-                                )
-                            }
-
-                            ztxpBtn.setOnClickListener {
-                                Strategy1Activity.openZTXPStrategy(
-                                    this@FPActivity,
-                                    codes,
-                                    binding.endTimeTv.text.toString()
-                                )
-                            }
-
-                            jxqsBtn.setOnClickListener {
-                                Strategy4Activity.openJXQSStrategy(
-                                    this@FPActivity,
-                                    codes,
-                                    binding.endTimeTv.text.toString()
-                                )
-                            }
-
-                            dfcfBtn.setOnClickListener {
-                                result.bk.openWeb(this@FPActivity)
-                            }
-
-
-                            dbhpBtn.setOnClickListener {
-                                Strategy6Activity.openDBHPStrategy(
-                                    this@FPActivity,
-                                    codes,
-                                    binding.endTimeTv.text.toString()
-                                )
-                            }
-
-                            ztqsBtn.setOnClickListener {
-                                Strategy7Activity.openZTQSStrategy(
-                                    this@FPActivity,
-                                    codes,
-                                    binding.endTimeTv.text.toString()
-                                )
-                            }
-
-                            addToBtn.setOnClickListener {
-
-                            }
-
-                            followBtn.setOnClickListener {
-                                pw.dismiss()
-                                lifecycleScope.launch(Dispatchers.IO) {
-                                    val p = data.indexOf(result)
-                                    if (result.follow) {
-                                        result.follow = false
-                                        Injector.appDatabase.followDao()
-                                            .deleteFollow(Follow(result.bk.code, 2))
-
-                                        lifecycleScope.launch(Dispatchers.Main) {
-                                            data.remove(result)
-                                            notifyItemRemoved(p)
-                                            delay(300)
-                                            data.add(itemCount - 1, result)
-                                            notifyItemInserted(itemCount - 1)
-                                        }
-
-                                    } else {
-                                        result.follow = true
-                                        Injector.appDatabase.followDao()
-                                            .insertFollow(Follow(result.bk.code, 2))
-
-                                        lifecycleScope.launch(Dispatchers.Main) {
-                                            data.remove(result)
-                                            notifyItemRemoved(p)
-                                            delay(300)
-                                            data.add(0, result)
-                                            notifyItemInserted(0)
-                                        }
-                                    }
-                                }
-                            }
-
-                            hideBtn.setOnClickListener {
-                                pw.dismiss()
-                                lifecycleScope.launch(Dispatchers.IO) {
-                                    val p = data.indexOf(result)
-                                    if (result.hide) {
-                                        result.hide = false
-                                        Injector.appDatabase.hideDao()
-                                            .deleteHide(Hide(result.bk.code, 2))
-                                    } else {
-                                        result.hide = true
-                                        Injector.appDatabase.hideDao()
-                                            .insertHide(Hide(result.bk.code, 2))
-                                    }
-                                    lifecycleScope.launch(Dispatchers.Main) {
-                                        notifyItemChanged(p)
-                                    }
-
-                                }
-                            }
-                        }
-
-                        pw.showAsDropDown(it, (ev?.x ?: 0f).toInt(), -1100)
-                        return@setOnLongClickListener true
-                    }
-
-                    root.setOnClickListener {
-                        if (selectedItem != null) {
-                            val i = data.indexOf(selectedItem)
-                            notifyItemChanged(i)
-                        }
-
-                        selectedItem = result
-                        val index = data.indexOf(selectedItem)
-                        notifyItemChanged(index)
-                        selectBK(result.bk.code)
-
-                    }
-                }
-
-
-            }
-
-        }
-
-        override fun onCreateViewHolder(parent: ViewGroup, p1: Int): VH {
-            return VH(ItemBkBinding.inflate(LayoutInflater.from(parent.context), parent, false))
-        }
-
-        override fun getItemCount(): Int {
-            return data.size
-        }
-
-        override fun onBindViewHolder(holder: VH, position: Int) {
-            holder.bind(data[position], position)
-        }
-    }
-
-
-    inner class StockAdapter() :
-        RecyclerView.Adapter<StockAdapter.VH>() {
-
-        private val data = mutableListOf<StockResult>()
-
-        private var popularitySort: Int = 0
-
-
-        fun setData(data: MutableList<StockResult>, popularitySort: Int = 0) {
-            this.data.clear()
-            this.data.addAll(data)
-            this.popularitySort = popularitySort
-            notifyDataSetChanged()
-        }
-
-
-        override fun onViewDetachedFromWindow(holder: VH) {
-            super.onViewDetachedFromWindow(holder)
-
-
-        }
-
-
-        private var job: Job? = null
-
-        override fun onDetachedFromRecyclerView(recyclerView: RecyclerView) {
-            super.onDetachedFromRecyclerView(recyclerView)
-            job?.cancel()
-        }
-
-        override fun onAttachedToRecyclerView(recyclerView: RecyclerView) {
-            super.onAttachedToRecyclerView(recyclerView)
-            if (isTradingTime()) {
-                job = lifecycleScope.launch(Dispatchers.IO) {
-                    while (true) {
-                        delay(1200)
-
-                        if (recyclerView.scrollState != RecyclerView.SCROLL_STATE_IDLE || !this@FPActivity.lifecycle.currentState.isAtLeast(
-                                Lifecycle.State.RESUMED
-                            )
-                        ) {
-                            continue
-                        }
-                        val lm = recyclerView.layoutManager as LinearLayoutManager
-                        val firstPos = lm.findFirstVisibleItemPosition()
-                        val lastPos = lm.findLastVisibleItemPosition()
-                        if (firstPos == RecyclerView.NO_POSITION || lastPos == RecyclerView.NO_POSITION) {
-                            continue
-                        }
-                        if (data.isNotEmpty()) {
-                            for (i in firstPos until lastPos + 1) {
-                                val result = data[i]
-                                if (result.currentDayHistory != null && !result.isGroupHeader) {
-                                    val s =
-                                        Injector.appDatabase.stockDao()
-                                            .getStockByCode(result.stock.code)
-                                    val h =
-                                        Injector.appDatabase.historyStockDao().getHistoryByDate3(
-                                            result.stock.code,
-                                            result.currentDayHistory!!.date
-                                        )
-                                    val n =
-                                        if (result.nextDayHistory != null) Injector.appDatabase.historyStockDao()
-                                            .getHistoryByDate3(
-                                                result.stock.code,
-                                                result.nextDayHistory!!.date
-                                            ) else null
-                                    if (h.chg != result.currentDayHistory!!.chg || n?.chg != result.nextDayHistory?.chg) {
-                                        val changeRate =
-                                            if (h.chg != result.currentDayHistory!!.chg) (h.chg - result.currentDayHistory!!.chg)
-                                            else (if (n == null || result.nextDayHistory == null) 0f
-                                            else n.chg - result.nextDayHistory!!.chg)
-                                        data[i] = result.copy(
-                                            stock = s,
-                                            currentDayHistory = h,
-                                            nextDayHistory = n,
-                                            changeRate = changeRate
-                                        )
-                                        launch(Dispatchers.Main) {
-                                            notifyItemChanged(i)
-                                        }
-
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-
-        inner class VH(val binding: ItemStock2Binding) : RecyclerView.ViewHolder(binding.root) {
-
-            var anim: ValueAnimator? = null
-
-            @RequiresApi(Build.VERSION_CODES.O)
-            fun bind(result: StockResult, position: Int) {
-
-
-                binding.contentLL.visibility = View.VISIBLE
-                binding.stockName.setOnClickListener(null)
-                binding.stockName.isClickable = false
-
-
-                val stock = result.stock
-                binding.apply {
-                    if (result.follow != null) {
-                        this.root.setBackgroundColor(0x33333333)
-                    } else {
-                        this.root.setBackgroundColor(0xffffffff.toInt())
-                    }
-
-                    if (result.changeRate != 0f) {
-                        colorView.visibility = View.VISIBLE
-                        if (colorView.tag != result.stock.code) {
-                            anim?.cancel()
-                        }
-
-                        anim =
-                            ValueAnimator.ofFloat(0f, min(abs(result.changeRate), 0.9f), 0f).apply {
-                                duration = 1700
-                                startDelay = (1700 * (1 - (anim?.animatedFraction ?: 1f))).toLong()
-
-                                addListener(object : AnimatorListenerAdapter() {
-                                    override fun onAnimationStart(animation: Animator) {
-                                        super.onAnimationStart(animation)
-                                        colorView.alpha = 1f
-                                        if (result.changeRate > 0) {
-                                            colorView.setBackgroundColor(Color.RED)
-                                        } else {
-                                            colorView.setBackgroundColor(STOCK_GREEN)
-                                        }
-                                    }
-
-                                    override fun onAnimationEnd(animation: Animator) {
-                                        super.onAnimationEnd(animation)
-                                        colorView.alpha = 0f
-                                        colorView.setBackgroundColor(Color.TRANSPARENT)
-                                        result.changeRate = 0f
-                                    }
-                                })
-                                this.addUpdateListener {
-                                    colorView.alpha = it.animatedValue as Float
-                                }
-                                start()
-                            }
-                        colorView.tag = stock.code
-                    } else {
-                        colorView.visibility = View.GONE
-                    }
-
-                    if (result.ztReplay != null && result.expandReason) {
-                        this.expoundTv.visibility = View.VISIBLE
-                        this.expoundTv.text =
-                            "${result.ztReplay!!.time}\n${result.ztReplay!!.expound}"
-                    } else {
-                        this.expoundTv.visibility = View.GONE
-                    }
-
-                    if (result.expandPOPReason && result.popularity != null) {
-                        this.popReasonTv.visibility = View.VISIBLE
-                        this.popReasonTv.text = "${result.popularity?.explain}"
-                    } else {
-                        this.popReasonTv.visibility = View.GONE
-                    }
-
-
-                    //一字板
-                    if (result.ztReplay != null && result.ztReplay!!.isYiZIBan) {
-                        binding.yizibanView.visibility = View.VISIBLE
-                    } else {
-                        binding.yizibanView.visibility = View.GONE
-                    }
-
-                    if (isShowLianBanFlag(binding.root.context)) {
-                        if (result.lianbanCount > 0) {
-                            binding.lianbanCountFlagTv.setBackgroundColor(
-                                Color.valueOf(
-                                    1f,
-                                    0f,
-                                    0f,
-                                    result.lianbanCount / 15f
-                                ).toArgb()
-                            )
-                            binding.lianbanCountFlagTv.visibility = View.VISIBLE
-                            binding.lianbanCountFlagTv.text = result.lianbanCount.toString()
-                        } else {
-                            binding.lianbanCountFlagTv.visibility = View.GONE
-                        }
-                    } else {
-                        binding.lianbanCountFlagTv.visibility = View.GONE
-                    }
-
-                    this.stockName.text = stock.name
-                    this.stockName.setTextColor(result.groupColor)
-
-
-                    if (result.dargonTigerRank != null) {
-                        this.dragonFlagIv.visibility = View.VISIBLE
-                        this.stockName.setOnClickListener {
-                            result.stock.openDragonTigerRank(this@FPActivity)
-                        }
-                    } else {
-                        this.dragonFlagIv.visibility = View.GONE
-                    }
-
-                    this.dragonFlagIv.setOnClickListener {
-                        result.stock.openDragonTigerRank(this@FPActivity)
-                    }
-
-
-                    if (result.currentDayHistory != null) {
-                        currentChg.setTextColor(result.currentDayHistory!!.color)
-                        currentChg.text = result.currentDayHistory!!.chg.toString()
-                        if (isShowCurrentChg(binding.root.context)) {
-                            currentChg.visibility = View.VISIBLE
-                        } else {
-                            currentChg.visibility = View.GONE
-                        }
-                    } else {
-                        currentChg.visibility = View.GONE
-                    }
-
-                    if (result.nextDayHistory != null) {
-                        nextDayChg.setTextColor(result.nextDayHistory!!.color)
-                        nextDayChg.text = result.nextDayHistory!!.chg.toString()
-                        if (isShowNextChg(binding.root.context)) {
-                            nextDayChg.visibility = View.VISIBLE
-                        } else {
-                            nextDayChg.visibility = View.GONE
-                        }
-
-                    } else {
-                        nextDayChg.visibility = View.GONE
-                    }
-
-
-                    if (popularitySort != 0) {
-                        if (result.popularity != null) {
-                            this.activeLabelTv.visibility = View.VISIBLE
-                            this.activeLabelTv.text =
-                                if (popularitySort == 1) result.popularity?.rank.toString() else if (popularitySort == 2) result.popularity?.thsRank.toString() else if (popularitySort == 4) result.popularity?.dzhRank.toString() else result.popularity?.tgbRank.toString()
-                        } else {
-                            this.activeLabelTv.visibility = View.INVISIBLE
-                        }
-                    } else {
-                        if (result.activeRate > 2) {
-                            this.activeLabelTv.visibility = View.VISIBLE
-                            this.activeLabelTv.text = result.activeRate.toInt().toString()
-                        } else {
-                            this.activeLabelTv.visibility = View.INVISIBLE
-                        }
-                    }
-
-
-
-
-                    this.nextDayIv.visibility =
-                        if (result.nextDayZT || result.nextDayCry) View.VISIBLE else View.GONE
-                    if (result.nextDayCry) {
-                        this.nextDayIv.setImageResource(R.drawable.ic_cry)
-                    }
-                    if (result.nextDayZT) {
-                        this.nextDayIv.setImageResource(R.drawable.ic_thumb_up)
-                    }
-
-                    root.setOnClickListener {
-                        stock.openWeb(this@FPActivity)
-                    }
-
-                    var ev: MotionEvent? = null
-                    root.setOnTouchListener { view, motionEvent ->
-                        if (motionEvent.action == MotionEvent.ACTION_DOWN) {
-                            ev = motionEvent
-                        }
-                        return@setOnTouchListener false
-                    }
-
-                    root.setOnLongClickListener {
-                        val b =
-                            LayoutStockPopupWindowBinding.inflate(LayoutInflater.from(it.context))
-
-                        if (result.follow != null) {
-                            b.followBtn.text = "取消关注"
-                        }
-
-                        if (result.follow?.stickyOnTop == 1) {
-                            b.stickyOnTopBtn.text = "取消置顶"
-                        }
-
-                        if (result.expandReason) {
-                            b.expandReasonBtn.text = "折叠涨停原因"
-                        }
-
-                        if (!result.zt) {
-                            b.expandReasonBtn.visibility = View.GONE
-                        } else {
-                            b.expandReasonBtn.visibility = View.VISIBLE
-                        }
-
-
-                        if (result.popularity == null) {
-                            b.expandPOPReasonBtn.visibility = View.GONE
-                        } else {
-                            b.expandPOPReasonBtn.visibility = View.VISIBLE
-                        }
-
-                        if (result.expandPOPReason) {
-                            b.expandPOPReasonBtn.text = "折叠热度原因"
-                        }
-
-
-                        val pw = PopupWindow(
-                            b.root,
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                            ViewGroup.LayoutParams.WRAP_CONTENT,
-                            true
-                        )
-
-                        b.expandReasonBtn.setOnClickListener {
-                            val p = data.indexOf(result)
-                            result.expandReason = !result.expandReason
-                            notifyItemChanged(p)
-                            pw.dismiss()
-                        }
-
-                        b.expandPOPReasonBtn.setOnClickListener {
-                            val p = data.indexOf(result)
-                            result.expandPOPReason = !result.expandPOPReason
-                            notifyItemChanged(p)
-                            pw.dismiss()
-                        }
-
-                        b.relatedConceptBtn.setOnClickListener {
-                            pw.dismiss()
-                            StockInfoFragment(
-                                result.stock,
-                                this@FPActivity.binding.endTimeTv.editableText.toString()
-                            ).show(
-                                this@FPActivity.supportFragmentManager,
-                                "stock_info"
-                            )
-                        }
-                        b.dragonTigerRankBtn.setOnClickListener {
-                            pw.dismiss()
-                            result.stock.openDragonTigerRank(this@FPActivity)
-                        }
-
-                        b.strongLinkStocksBtn.setOnClickListener {
-                            pw.dismiss()
-                            lifecycleScope.launch(Dispatchers.IO) {
-                                val codes = strongLinkCodesCsvForStrategy(result.stock.code)
-                                withContext(Dispatchers.Main) {
-                                    if (codes.isNullOrBlank()) {
-                                        Toast.makeText(
-                                            this@FPActivity,
-                                            "暂无强关联股票",
-                                            Toast.LENGTH_SHORT
-                                        ).show()
-                                    } else {
-                                        Strategy4Activity.openJXQSStrategyForStockCodes(
-                                            this@FPActivity,
-                                            codes,
-                                            this@FPActivity.binding.endTimeTv.text.toString()
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        //仅关注不置顶
-                        b.followBtn.setOnClickListener {
-                            pw.dismiss()
-                            lifecycleScope.launch(Dispatchers.IO) {
-                                val p = data.indexOf(result)
-                                if (result.follow != null) {
-                                    Injector.appDatabase.followDao()
-                                        .deleteFollow(Follow(result.stock.code, 1))
-
-                                    result.follow = null
-
-                                    lifecycleScope.launch(Dispatchers.Main) {
-                                        notifyItemChanged(p)
-                                    }
-
-                                } else {
-                                    result.follow = Follow(result.stock.code, 1, 0)
-                                    Injector.appDatabase.followDao()
-                                        .insertFollow(result.follow!!)
-                                    lifecycleScope.launch(Dispatchers.Main) {
-                                        notifyItemChanged(p)
-                                    }
-
-                                }
-
-
-                            }
-                        }
-
-                        b.stickyOnTopBtn.setOnClickListener {
-                            pw.dismiss()
-                            lifecycleScope.launch(Dispatchers.IO) {
-                                val p = data.indexOf(result)
-                                if (result.follow?.stickyOnTop == 1) {
-                                    val n = Follow(result.stock.code, 1, 0)
-                                    Injector.appDatabase.followDao().insertFollow(n)
-                                    result.follow = n
-
-                                    lifecycleScope.launch(Dispatchers.Main) {
-                                        data.remove(result)
-                                        notifyItemRemoved(p)
-                                        delay(300)
-                                        data.add(itemCount - 1, result)
-                                        notifyItemInserted(itemCount - 1)
-                                    }
-
-                                } else {
-                                    val n = Follow(result.stock.code, 1, 1)
-                                    result.follow = n
-                                    Injector.appDatabase.followDao()
-                                        .insertFollow(n)
-                                    lifecycleScope.launch(Dispatchers.Main) {
-                                        data.remove(result)
-                                        notifyItemRemoved(p)
-                                        delay(300)
-                                        data.add(0, result)
-                                        notifyItemInserted(0)
-                                    }
-
-                                }
-
-
-                            }
-
-                        }
-
-                        val arr = IntArray(2)
-                        binding.root.getLocationInWindow(arr)
-                        pw.showAsDropDown(
-                            it,
-                            (ev?.x ?: 0f).toInt(),
-                            -500 - (binding.root.height - (ev!!.y - arr[1])).toInt()
-                        )
-                        return@setOnLongClickListener true
-                    }
-
-                }
-            }
-
-        }
-
-        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
-            return VH(ItemStock2Binding.inflate(LayoutInflater.from(parent.context), parent, false))
-        }
-
-        override fun getItemCount(): Int {
-            return data.size
-        }
-
-        override fun onBindViewHolder(holder: VH, position: Int) {
-            holder.bind(data[position], position)
-        }
-
-
-    }
-
 
 }

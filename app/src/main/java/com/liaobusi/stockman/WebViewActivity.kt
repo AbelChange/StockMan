@@ -6,7 +6,6 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
-import android.util.Base64
 import android.util.Log
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -17,14 +16,13 @@ import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.google.gson.Gson
+import com.liaobusi.stockman.repo.StockRepo
 import com.liaobusi.stockman5.databinding.ActivityWebviewBinding
 import com.liaobusi.stockman.db.FPResponse
 import com.liaobusi.stockman.db.ZTReplayBean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.text.SimpleDateFormat
-import java.util.Locale
 import kotlin.text.removeSurrounding
 
 /**
@@ -49,75 +47,6 @@ open class WebViewActivity : AppCompatActivity() {
         }
 
         fun startDesktop(context: Context, url: String) = start(context, url, desktopUa = true)
-
-        /**
-         * 仅安装一次 hook；JSON 经 Base64 传给 Native，避免转义问题。
-         * 依赖 `JsonBridge.onJsonBase64`。
-         */
-        private val JSON_HOOK_SCRIPT = """
-            (function(){
-              if(window.__SM_JSON_HOOK__)return;
-              window.__SM_JSON_HOOK__=true;
-              var B=window.JsonBridge;
-              if(!B||!B.onJsonBase64)return;
-              function absUrl(u){
-                try{return new URL(u,document.baseURI).href;}catch(e){return u||'';}
-              }
-              function looksJson(t){
-                if(!t||typeof t!=='string')return false;
-                var s=t.trim();
-                if(s.length<2)return false;
-                var c0=s.charAt(0),c1=s.charAt(s.length-1);
-                if(!((c0==='{'&&c1==='}')||(c0==='['&&c1===']')))return false;
-                try{JSON.parse(s);return true;}catch(e){return false;}
-              }
-              function notify(url,text){
-                if(!looksJson(text))return;
-                try{
-                  var b=btoa(unescape(encodeURIComponent(text)));
-                  B.onJsonBase64(url,b);
-                }catch(e){}
-              }
-              var XPO=XMLHttpRequest.prototype;
-              var oOpen=XPO.open;
-              var oSend=XPO.send;
-              XPO.open=function(method,url){
-                this.__sm_url=absUrl(url);
-                return oOpen.apply(this,arguments);
-              };
-              XPO.send=function(body){
-                this.addEventListener('load',function(){
-                  var u=this.__sm_url||'';
-                  var ct=(this.getResponseHeader('Content-Type')||'').toLowerCase();
-                  if(ct.indexOf('json')>=0||ct.indexOf('javascript')>=0){
-                    notify(u,this.responseText);
-                  }else if(this.responseText){
-                    notify(u,this.responseText);
-                  }
-                });
-                return oSend.apply(this,arguments);
-              };
-              if(window.fetch){
-                var nf=window.fetch;
-                window.fetch=function(input,init){
-                  var raw=typeof input==='string'?input:(input&&input.url);
-                  var u=absUrl(raw||'');
-                  return nf.apply(this,arguments).then(function(resp){
-                    try{
-                      var ct=(resp.headers.get('content-type')||'').toLowerCase();
-                      if(ct.indexOf('json')>=0){
-                        return resp.clone().text().then(function(txt){
-                          notify(u,txt);
-                          return resp;
-                        });
-                      }
-                    }catch(e){}
-                    return resp;
-                  });
-                };
-              }
-            })();
-        """.trimIndent()
     }
 
     private lateinit var binding: ActivityWebviewBinding
@@ -258,47 +187,7 @@ open class WebViewActivity : AppCompatActivity() {
             if (type == "up_pool") {
                 lifecycleScope.launch(Dispatchers.IO) {
                     val inserted = runCatching {
-                        val rsp = Gson().fromJson(json, ClsUpPoolResponse::class.java)
-                        val items = rsp.data.orEmpty()
-                        if (items.isEmpty()) return@runCatching 0
-
-                        val list = mutableListOf<ZTReplayBean>()
-                        items.forEach { it ->
-                            val code = it.secuCode.orEmpty()
-                                .removePrefix("sz")
-                                .removePrefix("sh")
-                                .removePrefix("bj")
-                                .takeLast(6)
-                            if (code.length != 6) return@forEach
-
-                            val date = parseClsDate(it.time) ?: today()
-                            val limitUpTime = parseClsTime(it.time) ?: "--:--:--"
-                            val expound3 = buildString {
-                                append(it.secuName.orEmpty())
-                                if ((it.limitUpDays ?: 0) > 0) append(" 连板:${it.limitUpDays}")
-                                if (!it.upReason.isNullOrBlank()) append(" 原因:${it.upReason}")
-                            }.trim().take(2000)
-
-                            val old = Injector.appDatabase.ztReplayDao().getZTReplay(date, code)
-                            val bean = old?.copy(
-                                expound3 = expound3,
-                                time = if (old.time == "--:--:--") limitUpTime else old.time,
-                            )
-                                ?: ZTReplayBean(
-                                    date = date,
-                                    code = code,
-                                    reason = "",
-                                    groupName = "",
-                                    expound = "",
-                                    time = limitUpTime,
-                                    expound3 = expound3,
-                                )
-                            list.add(bean)
-                        }
-                        if (list.isNotEmpty()) {
-                            Injector.appDatabase.ztReplayDao().insertAll(list)
-                        }
-                        list.size
+                        StockRepo.saveClsUpPoolJson(json)
                     }.getOrElse { e ->
                         Log.e(TAG, "CLS up_pool parse failed", e)
                         0
@@ -313,66 +202,15 @@ open class WebViewActivity : AppCompatActivity() {
 
     }
 
-    private data class ClsUpPoolResponse(
-        val code: Int? = null,
-        val msg: String? = null,
-        val data: List<ClsUpPoolItem>? = null,
-    )
-
-    private data class ClsUpPoolItem(
-        val secu_code: String? = null,
-        val secu_name: String? = null,
-        val up_reason: String? = null,
-        val time: String? = null,
-        val limit_up_days: Int? = null,
-    ) {
-        val secuCode: String? get() = secu_code
-        val secuName: String? get() = secu_name
-        val upReason: String? get() = up_reason
-        val limitUpDays: Int? get() = limit_up_days
-    }
-
-    private fun parseClsDate(time: String?): Int? {
-        if (time.isNullOrBlank()) return null
-        // "2026-04-30 10:27:27"
-        val datePart = time.trim().take(10)
-        val s = datePart.replace("-", "")
-        return s.toIntOrNull()
-            ?: runCatching {
-                val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
-                val d = sdf.parse(time) ?: return@runCatching null
-                SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(d).toInt()
-            }.getOrNull()
-    }
-
-    private fun parseClsTime(time: String?): String? {
-        if (time.isNullOrBlank()) return null
-        // "2026-04-30 10:27:27" -> "10:27:27"
-        val t = time.trim()
-        val idx = t.indexOf(' ')
-        if (idx >= 0 && idx + 1 < t.length) {
-            val s = t.substring(idx + 1).trim()
-            if (s.length >= 8 && s[2] == ':' && s[5] == ':') return s.take(8)
-        }
-        return runCatching {
-            val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
-            val d = sdf.parse(time) ?: return@runCatching null
-            SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(d)
-        }.getOrNull()
-    }
-
     private fun injectJsonInterceptScript(wv: WebView) {
-        wv.evaluateJavascript(JSON_HOOK_SCRIPT, null)
+        WebViewJsonInterceptor.inject(wv)
     }
 
     @SuppressLint("JavascriptInterface")
     private inner class JsonBridge {
         @JavascriptInterface
         fun onJsonBase64(url: String, b64: String) {
-            if (b64.isEmpty()) return
-            val json = runCatching {
-                String(Base64.decode(b64, Base64.DEFAULT), Charsets.UTF_8)
-            }.getOrNull() ?: return
+            val json = WebViewJsonInterceptor.decodeBase64Json(b64) ?: return
             runOnUiThread { onJsonIntercepted(url, json) }
         }
     }

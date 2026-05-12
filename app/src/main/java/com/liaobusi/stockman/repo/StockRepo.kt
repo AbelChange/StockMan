@@ -331,7 +331,7 @@ object StockRepo {
 
             }
         }
-        Injector.appDatabase.ztReplayDao().insertAll(ztReplayBeanList)
+        appDatabase.ztReplayDao().insertAll(ztReplayBeanList)
 
     }
 
@@ -345,7 +345,7 @@ object StockRepo {
     suspend fun filterStockByGDRS(stocks: List<StockResult>, count: Int): List<StockResult> =
         withContext(Dispatchers.IO) {
             val l = mutableListOf<StockResult>()
-            val gdrsDao = Injector.appDatabase.gdrsDao()
+            val gdrsDao = appDatabase.gdrsDao()
             stocks.forEach {
                 val list = gdrsDao.getGDRSByCode(it.stock.code)
                 val m = kotlin.math.min(list.size - 1, count)
@@ -1125,6 +1125,97 @@ object StockRepo {
         } catch (e: Throwable) {
             e.printStackTrace()
         }
+    }
+
+    fun saveClsUpPoolJson(json: String): Int {
+        val rsp = Gson().fromJson(json, ClsUpPoolResponse::class.java)
+        val items = rsp.data.orEmpty()
+        if (items.isEmpty()) return 0
+
+        val list = mutableListOf<ZTReplayBean>()
+        items.forEach { item ->
+            val code = item.secuCode.orEmpty()
+                .removePrefix("sz")
+                .removePrefix("sh")
+                .removePrefix("bj")
+                .takeLast(6)
+            if (code.length != 6) return@forEach
+
+            val date = parseClsDate(item.time) ?: today()
+            val limitUpTime = parseClsTime(item.time) ?: "--:--:--"
+            val expound3 = buildString {
+                append(item.secuName.orEmpty())
+                if ((item.limitUpDays ?: 0) > 0) append(" 连板:${item.limitUpDays}")
+                if (!item.upReason.isNullOrBlank()) append(" 原因:${item.upReason}")
+            }.trim().take(2000)
+
+            val old = appDatabase.ztReplayDao().getZTReplay(date, code)
+            val bean = old?.copy(
+                expound3 = expound3,
+                time = if (old.time == "--:--:--") limitUpTime else old.time,
+            ) ?: ZTReplayBean(
+                date = date,
+                code = code,
+                reason = "",
+                groupName = "",
+                expound = "",
+                time = limitUpTime,
+                expound3 = expound3,
+            )
+            list.add(bean)
+        }
+        if (list.isNotEmpty()) {
+            appDatabase.ztReplayDao().insertAll(list)
+        }
+        return list.size
+    }
+
+    private data class ClsUpPoolResponse(
+        val code: Int? = null,
+        val msg: String? = null,
+        val data: List<ClsUpPoolItem>? = null,
+    )
+
+    private data class ClsUpPoolItem(
+        val secu_code: String? = null,
+        val secu_name: String? = null,
+        val up_reason: String? = null,
+        val time: String? = null,
+        val limit_up_days: Int? = null,
+    ) {
+        val secuCode: String? get() = secu_code
+        val secuName: String? get() = secu_name
+        val upReason: String? get() = up_reason
+        val limitUpDays: Int? get() = limit_up_days
+    }
+
+    private fun parseClsDate(time: String?): Int? {
+        if (time.isNullOrBlank()) return null
+        // "2026-04-30 10:27:27"
+        val datePart = time.trim().take(10)
+        val s = datePart.replace("-", "")
+        return s.toIntOrNull()
+            ?: runCatching {
+                val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+                val d = sdf.parse(time) ?: return@runCatching null
+                SimpleDateFormat("yyyyMMdd", Locale.getDefault()).format(d).toInt()
+            }.getOrNull()
+    }
+
+    private fun parseClsTime(time: String?): String? {
+        if (time.isNullOrBlank()) return null
+        // "2026-04-30 10:27:27" -> "10:27:27"
+        val t = time.trim()
+        val idx = t.indexOf(' ')
+        if (idx >= 0 && idx + 1 < t.length) {
+            val s = t.substring(idx + 1).trim()
+            if (s.length >= 8 && s[2] == ':' && s[5] == ':') return s.take(8)
+        }
+        return runCatching {
+            val sdf = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
+            val d = sdf.parse(time) ?: return@runCatching null
+            SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(d)
+        }.getOrNull()
     }
 
     suspend fun getLimitDownPool(date: Int) {
