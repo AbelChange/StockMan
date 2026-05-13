@@ -11,6 +11,9 @@ interface EastMoneyApi {
     @Headers(
         "Referer: https://quote.eastmoney.com/center/gridlist.html",
         "User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+        "Accept: */*",
+        "Accept-Encoding: identity",
+        "Connection: close",
     )
     @GET("api/qt/clist/get")
     suspend fun getRealtimeStocks(

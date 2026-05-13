@@ -9,8 +9,8 @@ will decompose, implement, verify, and deliver the change with minimal follow-up
 `stockman-monitor` is a local Web monitor extracted from the Android StockMan
 unusual-movement tracking logic.
 
-- `server`: Ktor + SQLite backend. It syncs realtime stock data, persists data,
-  detects unusual movements, exposes REST endpoints, and pushes WebSocket updates.
+- `server`: Ktor + SQLite backend. It syncs and persists baseline market data,
+  stores config/follows/sectors/source data, and exposes REST endpoints.
 - `web`: Kotlin Compose for Web frontend. It renders monitor pages, market tables,
   DB viewer workflows, KPL live replay, alerts, and browser notifications.
 - Runtime database: `server/data/stockman-monitor.db`.
@@ -41,8 +41,8 @@ asks for a narrower action.
 
 - Implements the smallest coherent change using current project patterns.
 - Keeps backend, frontend, and model changes in sync.
-- Preserves existing REST/WebSocket contracts unless the requirement explicitly
-  changes them.
+- Preserves existing REST contracts unless the requirement explicitly changes
+  them.
 - Avoids unrelated refactors, generated churn, and changes to runtime data/logs.
 
 ### QA
@@ -60,7 +60,7 @@ asks for a narrower action.
 - Prefer straightforward functions and data classes over broad abstractions.
 - Keep backend code under `server/src/main/kotlin/com/liaobusi/stockman/monitor`.
 - Keep frontend code under `web/src/jsMain/kotlin/com/liaobusi/stockman/monitor/web`.
-- Keep REST DTOs and WebSocket DTOs serializable and explicit.
+- Keep REST DTOs serializable and explicit.
 - Do not introduce a new framework, package manager, or formatting tool unless
   the user specifically asks.
 
@@ -80,6 +80,19 @@ asks for a narrower action.
   hand-build long URLs in business logic when a strategy config can express them.
 - Be careful with external data sources. They may be slow, incomplete, throttled,
   or unavailable; handle failures without destroying existing DB state.
+- Keep high-frequency monitor quotes off the server. The monitor page should pull
+  Sina realtime quotes in the browser every 2s, evaluate monitor strategies in
+  the browser, show browser notifications locally, and avoid server-side
+  full-market polling loops.
+- Do not use WebSocket or a backend tick-ingest endpoint for monitor alerts
+  unless the user explicitly asks for multi-client/server-side notification
+  persistence.
+- Monitor alert history is not persisted. Keep current-day/current-page alert
+  events in frontend memory only; do not add localStorage, IndexedDB, or backend
+  writes unless explicitly requested.
+- Server-side stock sync should be startup/manual/scheduled low-frequency only.
+  Do not fetch or rewrite `stock` data on every monitor tick; if stock metadata is
+  missing, sync it once and then reuse the persisted data.
 - Do not commit or rely on `server/data/`, `run-logs/`, or local runtime output.
 
 ### Frontend Rules
@@ -87,9 +100,11 @@ asks for a narrower action.
 - Compose for Web UI starts in `App.kt`; keep state local unless it clearly needs
   a reusable model/helper.
 - Keep API models in `web/Models.kt` aligned with backend response shapes.
-- WebSocket URL currently targets backend port `8080` on the same host.
-- Keep monitor refresh intervals bounded by the existing min/max rules unless the
-  requirement changes the product behavior.
+- Do not add a WebSocket monitor channel for local alerts; the monitor page owns
+  realtime strategy state and browser notifications.
+- Keep monitor quote refresh at the project-standard 2s cadence unless the user
+  explicitly changes it. Do not couple this high-frequency quote loop to source
+  configuration refreshes or backend metadata sync.
 - Preserve browser notification gating: notifications should be shown only when
   monitoring is enabled and trading-time logic allows it.
 - Operational UI should stay dense, scannable, and work-focused. Avoid marketing
@@ -199,6 +214,12 @@ curl -X POST "http://localhost:8080/api/sync/history/start"
 Final responses must use this shape:
 
 ```text
+团队分工：
+- PM：需求拆解、验收标准、产品取舍。
+- Dev：实现范围、关键文件、技术取舍。
+- QA：验证命令、运行结果、残余风险。
+- Orchestrator：整体协调、最终结论、下一步。
+
 完成：
 - ...
 

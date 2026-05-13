@@ -1,6 +1,7 @@
 package com.liaobusi.stockman.monitor.network
 
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.logging.HttpLoggingInterceptor
 import org.slf4j.LoggerFactory
 import retrofit2.Retrofit
@@ -15,10 +16,10 @@ import javax.net.ssl.X509TrustManager
 object MarketApiFactory {
     private val httpLogger = LoggerFactory.getLogger("OkHttp")
 
-    fun eastMoneyRealtimeApi(): EastMoneyApi {
+    fun eastMoneyRealtimeApi(host: String = "43.push2.eastmoney.com"): EastMoneyApi {
         return retrofit(
-            baseUrl = "http://20.push2.eastmoney.com/",
-            client = trustAllOkHttpClient()
+            baseUrl = "https://$host/",
+            client = defaultOkHttpClient()
         ).create(EastMoneyApi::class.java)
     }
 
@@ -68,6 +69,7 @@ object MarketApiFactory {
     private fun defaultOkHttpClient(): OkHttpClient {
         return OkHttpClient.Builder()
             .addInterceptor(loggingInterceptor())
+            .protocols(listOf(Protocol.HTTP_1_1))
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .build()
@@ -83,6 +85,7 @@ object MarketApiFactory {
         sslContext.init(null, arrayOf(trustManager), SecureRandom())
         return OkHttpClient.Builder()
             .addInterceptor(loggingInterceptor())
+            .protocols(listOf(Protocol.HTTP_1_1))
             .sslSocketFactory(sslContext.socketFactory, trustManager)
             .hostnameVerifier { _, _ -> true }
             .connectTimeout(15, TimeUnit.SECONDS)
@@ -92,6 +95,6 @@ object MarketApiFactory {
 
     private fun loggingInterceptor(): HttpLoggingInterceptor {
         return HttpLoggingInterceptor { message -> httpLogger.info(message) }
-            .setLevel(HttpLoggingInterceptor.Level.BODY)
+            .setLevel(HttpLoggingInterceptor.Level.NONE)
     }
 }

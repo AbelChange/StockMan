@@ -18,8 +18,6 @@ import io.ktor.server.response.respondText
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
 import io.ktor.server.routing.routing
-import io.ktor.server.websocket.WebSockets
-import io.ktor.server.websocket.webSocket
 import kotlinx.serialization.json.Json
 import okhttp3.FormBody
 import okhttp3.OkHttpClient
@@ -65,18 +63,12 @@ fun Application.monitorModule() {
         allowHost("localhost:8081")
         allowHost("127.0.0.1:8081")
     }
-    install(WebSockets) {
-        maxFrameSize = Long.MAX_VALUE
-        masking = false
-    }
-
     routing {
         get("/") {
             call.respond(
                 mapOf(
                     "name" to "StockMan Compose Monitor",
                     "status" to "running",
-                    "webSocket" to "ws://localhost:8080/ws",
                     "database" to engine.database.path(),
                     "dbViewer" to "http://localhost:8080/db"
                 )
@@ -87,6 +79,14 @@ fun Application.monitorModule() {
         }
         get("/api/snapshot") {
             call.respond(engine.snapshot())
+        }
+        get("/api/stocks") {
+            val codes = call.request.queryParameters["codes"].orEmpty()
+                .split(',', ' ', '，')
+                .map { it.trim() }
+                .filter { it.length == 6 && it.all(Char::isDigit) }
+                .toSet()
+            call.respond(engine.stockTicks(codes))
         }
         get("/api/sync/status") {
             call.respond(engine.syncStatus())
@@ -151,12 +151,6 @@ fun Application.monitorModule() {
                 serverLogger.warn("HTTP POST /api/sync/unusual/kpl failed: {}", it.message)
                 call.respond(HttpStatusCode.BadRequest, mapOf("error" to (it.message ?: "kpl unusual sync failed")))
             }
-        }
-        get("/api/monitor/alerts") {
-            val code = call.request.queryParameters["code"]?.trim()?.takeIf { it.isNotBlank() }
-            val date = call.request.queryParameters["date"]?.toIntOrNull()
-            val limit = call.request.queryParameters["limit"]?.toIntOrNull() ?: 100
-            call.respond(engine.monitorAlerts(code = code, date = date, limit = limit))
         }
         post("/api/sync/limit-up-pool") {
             val date = call.request.queryParameters["date"]?.toIntOrNull()
@@ -267,9 +261,6 @@ fun Application.monitorModule() {
             } else {
                 call.respond(tick)
             }
-        }
-        webSocket("/ws") {
-            engine.connect(this)
         }
     }
 }

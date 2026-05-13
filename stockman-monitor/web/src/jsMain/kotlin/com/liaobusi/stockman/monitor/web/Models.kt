@@ -32,13 +32,6 @@ data class AlertEvent(
 )
 
 @Serializable
-data class ClientMessage(
-    val type: String,
-    val stocks: List<StockTick> = emptyList(),
-    val alert: AlertEvent? = null
-)
-
-@Serializable
 data class MonitorConfig(
     val enabled: Boolean = false,
     val targetSources: List<String> = listOf("limit_up"),

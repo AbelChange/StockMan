@@ -85,6 +85,12 @@ QA records:
 Orchestrator final answer:
 
 ```text
+团队分工：
+- PM：需求拆解/验收标准/产品取舍。
+- Dev：实现范围/关键文件/技术取舍。
+- QA：验证命令/运行结果/残余风险。
+- Orchestrator：整体协调/最终结论/下一步。
+
 完成：
 - What changed, by behavior and file area.
 

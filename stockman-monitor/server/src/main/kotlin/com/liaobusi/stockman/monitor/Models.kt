@@ -41,13 +41,6 @@ data class MonitorSnapshot(
 )
 
 @Serializable
-data class ClientMessage(
-    val type: String,
-    val stocks: List<StockTick> = emptyList(),
-    val alert: AlertEvent? = null
-)
-
-@Serializable
 data class ManualTickRequest(
     val code: String,
     val price: Double? = null,

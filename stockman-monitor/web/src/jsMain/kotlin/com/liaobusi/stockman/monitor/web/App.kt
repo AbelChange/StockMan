@@ -17,6 +17,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
+import kotlin.math.round
 import org.jetbrains.compose.web.attributes.InputType
 import org.jetbrains.compose.web.attributes.disabled
 import org.jetbrains.compose.web.attributes.placeholder
@@ -70,12 +71,9 @@ import org.jetbrains.compose.web.dom.Th
 import org.jetbrains.compose.web.dom.Thead
 import org.jetbrains.compose.web.dom.Tr
 import org.jetbrains.compose.web.renderComposable
-import org.w3c.dom.WebSocket
-import org.w3c.dom.events.Event
 
 private val json = Json { ignoreUnknownKeys = true }
-private const val MONITOR_REFRESH_MIN_SECONDS = 2
-private const val MONITOR_REFRESH_MAX_SECONDS = 10
+private const val MONITOR_QUOTE_REFRESH_MS = 2_000L
 
 fun main() {
     renderComposable(rootElementId = "root") {
@@ -88,6 +86,9 @@ fun main() {
 fun MonitorApp() {
     val stocks = remember { mutableStateListOf<StockTick>() }
     val alerts = remember { mutableStateListOf<AlertEvent>() }
+    val stockMetadataByCode = remember { mutableMapOf<String, StockTick>() }
+    val localTrackers = remember { mutableMapOf<String, ClientMonitorTracker>() }
+    val lastAlertByCodeAndType = remember { mutableMapOf<String, Long>() }
     val selectedSources = remember { mutableStateListOf<String>() }
     var connected by remember { mutableStateOf(false) }
     var activePage by remember { mutableStateOf("monitor") }
@@ -97,10 +98,11 @@ fun MonitorApp() {
     var customCodes by remember { mutableStateOf("") }
     var customBkCodes by remember { mutableStateOf("") }
     var monitoringEnabled by remember { mutableStateOf(false) }
-    var monitorRefreshSeconds by remember { mutableStateOf(5) }
     var backendTargetSources by remember { mutableStateOf(listOf("limit_up")) }
     var cooldownSeconds by remember { mutableStateOf(60) }
     var tradingTime by remember { mutableStateOf(isTradingTime()) }
+    var sourceEditorOpen by remember { mutableStateOf(false) }
+    var alertFilter by remember { mutableStateOf("all") }
     var notificationState by remember {
         mutableStateOf(runCatching { Notification.permission }.getOrDefault("default"))
     }
@@ -113,25 +115,11 @@ fun MonitorApp() {
             customCodes = config.customCodes.joinToString(" ")
             customBkCodes = config.customBkCodes.joinToString(" ")
             cooldownSeconds = config.cooldownSeconds
-            val recentAlerts = loadRecentAlerts()
             alerts.clear()
-            alerts.addAll(recentAlerts.take(30))
+            connected = true
+        }.onFailure {
+            connected = false
         }
-        connectWebSocket(
-            onOpen = { connected = true },
-            onClose = { connected = false },
-            onStocks = { next ->
-                stocks.clear()
-                stocks.addAll(next.sortedByDescending { it.chg })
-            },
-            onAlert = { alert ->
-                if (monitoringEnabled && isTradingTime()) {
-                    alerts.add(0, alert)
-                    if (alerts.size > 30) alerts.removeLast()
-                    showNotification(alert)
-                }
-            }
-        )
     }
 
     LaunchedEffect(Unit) {
@@ -144,14 +132,72 @@ fun MonitorApp() {
         }
     }
 
-    LaunchedEffect(selectedSources.toList(), customCodes, monitorRefreshSeconds, backendTargetSources) {
-        while (true) {
-            val result = loadMonitorSourceMap(selectedSources.toList(), customCodes)
-            val backend = loadBackendTargetMap()
-            monitorSourcesByCode = mergeSourceMaps(result.sourcesByCode, backend.sourcesByCode)
-            monitorTargetsByCode = backend.targetsByCode
-            monitorSourceStatus = listOf(result.message, backend.message).filter { it.isNotBlank() }.joinToString("；")
-            delay(monitorRefreshSeconds.coerceIn(MONITOR_REFRESH_MIN_SECONDS, MONITOR_REFRESH_MAX_SECONDS) * 1_000L)
+    LaunchedEffect(selectedSources.toList(), customCodes, backendTargetSources) {
+        val result = loadMonitorSourceMap(selectedSources.toList(), customCodes)
+        val backend = loadBackendTargetMap()
+        monitorSourcesByCode = mergeSourceMaps(result.sourcesByCode, backend.sourcesByCode)
+        monitorTargetsByCode = backend.targetsByCode
+        monitorSourceStatus = listOf(result.message, backend.message).filter { it.isNotBlank() }.joinToString("；")
+        val activeCodes = monitorSourcesByCode.keys
+        localTrackers.keys.retainAll(activeCodes)
+        lastAlertByCodeAndType.keys.removeAll { key -> key.substringBefore(":") !in activeCodes }
+        val metadata = loadStockTicks(activeCodes)
+        stockMetadataByCode.keys.retainAll(activeCodes)
+        metadata.forEach { stockMetadataByCode[it.code] = it }
+        val byCode = stocks.associateBy { it.code }.toMutableMap()
+        metadata.forEach { tick ->
+            if (byCode[tick.code] == null) byCode[tick.code] = tick
+        }
+        stocks.clear()
+        stocks.addAll(byCode.values.filter { it.code in activeCodes }.sortedByDescending { it.chg })
+    }
+
+    LaunchedEffect(monitoringEnabled, tradingTime, monitorSourcesByCode.keys.sorted().joinToString(",")) {
+        while (monitoringEnabled && tradingTime) {
+            val targetCodes = monitorSourcesByCode.keys
+            if (targetCodes.isNotEmpty()) {
+                runCatching {
+                    val realtimeTicks = fetchSinaRealtimeTicks(targetCodes)
+                    val cachedByCode = stockMetadataByCode.toMutableMap()
+                    stocks.forEach { cachedByCode[it.code] = it }
+                    val targetTicks = realtimeTicks
+                        .map { tick -> mergeClientStockTick(tick, cachedByCode[tick.code]) }
+                    if (targetTicks.isNotEmpty()) {
+                        val byCode = stocks.associateBy { it.code }.toMutableMap()
+                        targetTicks.forEach { byCode[it.code] = it }
+                        stocks.clear()
+                        stocks.addAll(byCode.values.filter { it.code in targetCodes }.sortedByDescending { it.chg })
+                        val now = (js("Date.now()") as Double).toLong()
+                        targetTicks.forEach { tick ->
+                            val candidate = localTrackers.getOrPut(tick.code) { ClientMonitorTracker() }.update(tick)
+                                ?: return@forEach
+                            val allowedTypes = candidate.eventTypes.distinct().filter { type ->
+                                val key = "${tick.code}:$type"
+                                val previous = lastAlertByCodeAndType[key] ?: 0L
+                                now - previous >= cooldownSeconds * 1000L
+                            }
+                            if (allowedTypes.isEmpty()) return@forEach
+                            allowedTypes.forEach { type -> lastAlertByCodeAndType["${tick.code}:$type"] = now }
+                            val target = monitorTargetsByCode[tick.code]
+                            val sourceLabels = monitorSourcesByCode[tick.code]
+                                ?.split(" / ")
+                                ?.filter { it.isNotBlank() }
+                                .orEmpty()
+                            val alert = candidate.toAlert(
+                                allowedTypes = allowedTypes,
+                                sources = target?.sources?.takeIf { it.isNotEmpty() } ?: sourceLabels,
+                                replay = target?.replay
+                            )
+                            alerts.add(0, alert)
+                            if (alerts.size > 30) alerts.removeLast()
+                            showNotification(alert)
+                        }
+                    }
+                }.onFailure {
+                    monitorSourceStatus = listOf(monitorSourceStatus, "前端行情失败").filter { it.isNotBlank() }.joinToString("；")
+                }
+            }
+            delay(MONITOR_QUOTE_REFRESH_MS)
         }
     }
 
@@ -168,11 +214,35 @@ fun MonitorApp() {
             )
             when (activePage) {
                 "monitor" -> {
+                val monitorStocks = stocks
+                    .mapNotNull { stock ->
+                        val source = monitorSourcesByCode[stock.code]
+                        if (source == null) null else MonitorStock(stock, source, monitorTargetsByCode[stock.code])
+                    }
+                    .sortedWith(
+                        compareByDescending<MonitorStock> { item -> alerts.firstOrNull { it.code == item.tick.code }?.time ?: 0L }
+                            .thenByDescending { it.actionScore() }
+                            .thenByDescending { it.tick.chg }
+                    )
+                val filteredAlerts = alerts.filter { alertFilter == "all" || it.primaryEventType() == alertFilter }
+                DashboardStats(
+                    enabled = monitoringEnabled,
+                    tradingTime = tradingTime,
+                    connected = connected,
+                    notificationState = notificationState,
+                    stockCount = stockMetadataByCode.size,
+                    targetCount = monitorStocks.size,
+                    alerts = alerts,
+                    cooldownSeconds = cooldownSeconds
+                )
                 MonitorSourcePanel(
                     selectedSources = selectedSources,
                     backendTargetSources = backendTargetSources,
                     cooldownSeconds = cooldownSeconds,
                     status = monitorSourceStatus,
+                    targetCount = monitorStocks.size,
+                    expanded = sourceEditorOpen,
+                    onToggleExpanded = { sourceEditorOpen = !sourceEditorOpen },
                     onToggleSource = { id ->
                         if (selectedSources.contains(id)) selectedSources.remove(id) else selectedSources.add(id)
                     },
@@ -198,32 +268,28 @@ fun MonitorApp() {
                         }
                     }
                 )
-                val monitorStocks = stocks
-                    .mapNotNull { stock ->
-                        val source = monitorSourcesByCode[stock.code]
-                        if (source == null) null else MonitorStock(stock, source, monitorTargetsByCode[stock.code])
-                    }
-                    .sortedByDescending { it.tick.chg }
                 Div({ classes(AppStyles.panel, AppStyles.alertPanel) }) {
-                    SectionTitle("异动通知", if (monitoringEnabled) "${alerts.size} 条" else "未开始监控")
-                    AlertList(alerts)
+                    AlertHeader(
+                        enabled = monitoringEnabled,
+                        alertFilter = alertFilter,
+                        alerts = alerts,
+                        onFilterChange = { alertFilter = it }
+                    )
+                    AlertList(filteredAlerts)
                 }
                 Div({ classes(AppStyles.panel, AppStyles.marketPanel) }) {
                     MonitorSectionTitle(
                         enabled = monitoringEnabled,
                         tradingTime = tradingTime,
-                        refreshSeconds = monitorRefreshSeconds,
-                        meta = "${monitorStocks.size} / ${stocks.size} 只标的",
-                        onRefreshSecondsChange = { monitorRefreshSeconds = it.coerceIn(MONITOR_REFRESH_MIN_SECONDS, MONITOR_REFRESH_MAX_SECONDS) },
+                        meta = "${monitorStocks.size} 只标的",
                         onStart = {
                             if (isTradingTime()) {
                                 saveMonitorConfigAsync(true, backendTargetSources, customCodes, customBkCodes, cooldownSeconds) {}
-                                postMonitorAction("start")
                                 monitoringEnabled = true
                             }
                         },
                         onStop = {
-                            postMonitorAction("stop")
+                            saveMonitorConfigAsync(false, backendTargetSources, customCodes, customBkCodes, cooldownSeconds) {}
                             monitoringEnabled = false
                         }
                     )
@@ -253,27 +319,6 @@ fun MonitorApp() {
                 "jiuyang" -> JiuyangPage()
             }
         }
-    }
-}
-
-private fun connectWebSocket(
-    onOpen: () -> Unit,
-    onClose: () -> Unit,
-    onStocks: (List<StockTick>) -> Unit,
-    onAlert: (AlertEvent) -> Unit
-) {
-    val protocol = if (window.location.protocol == "https:") "wss" else "ws"
-    val host = window.location.hostname.ifBlank { "localhost" }
-    val socket = WebSocket("$protocol://$host:8080/ws")
-    socket.onopen = { _: Event -> onOpen() }
-    socket.onclose = { _: Event -> onClose() }
-    socket.onerror = { _: Event -> onClose() }
-    socket.onmessage = { event ->
-        val message = json.decodeFromString<ClientMessage>(event.asDynamic().data.toString())
-        if (message.stocks.isNotEmpty()) {
-            onStocks(message.stocks)
-        }
-        message.alert?.let(onAlert)
     }
 }
 
@@ -651,12 +696,70 @@ fun SectionTitle(title: String, meta: String) {
 }
 
 @Composable
+fun DashboardStats(
+    enabled: Boolean,
+    tradingTime: Boolean,
+    connected: Boolean,
+    notificationState: String,
+    stockCount: Int,
+    targetCount: Int,
+    alerts: List<AlertEvent>,
+    cooldownSeconds: Int
+) {
+    Div({ classes(AppStyles.dashboardGrid) }) {
+        StatusTile("监控", if (enabled) "运行中" else if (tradingTime) "未开始" else "非交易", if (enabled) "目标 $targetCount 只" else "等待启动")
+        StatusTile("行情", "前端 2s", if (connected) "服务配置已加载 · 本地缓存 $stockCount 只" else "服务配置未连接")
+        StatusTile("通知", "${alerts.size} 条", alertEventSummary(alerts))
+        StatusTile("策略", "涨速/跌速", "2s行情 · 15s 0.5% · 冷却 ${cooldownSeconds}s")
+        StatusTile("浏览器通知", notificationLabel(notificationState), notificationHelp(notificationState))
+    }
+}
+
+@Composable
+private fun StatusTile(label: String, value: String, meta: String) {
+    Div({ classes(AppStyles.statusTile) }) {
+        Span({ classes(AppStyles.statusLabel) }) { Text(label) }
+        Span({ classes(AppStyles.statusValue) }) { Text(value) }
+        Span({ classes(AppStyles.statusMeta) }) { Text(meta) }
+    }
+}
+
+@Composable
+fun AlertHeader(
+    enabled: Boolean,
+    alertFilter: String,
+    alerts: List<AlertEvent>,
+    onFilterChange: (String) -> Unit
+) {
+    Div({ classes(AppStyles.alertHeader) }) {
+        Div {
+            H2 { Text("异动通知") }
+            Span({ classes(AppStyles.statusMeta) }) { Text(if (enabled) "${alerts.size} 条" else "未开始监控") }
+        }
+        Div({ classes(AppStyles.filterBar) }) {
+            listOf(
+                "all" to "全部",
+                "LIMIT_UP" to "涨停",
+                "BREAK_LIMIT_UP" to "炸板",
+                "SPIKE" to "急涨",
+                "DROP" to "急跌",
+                "LIMIT_DOWN" to "跌停",
+                "OPEN_LIMIT_DOWN" to "翘板"
+            ).forEach { (id, name) ->
+                Button(attrs = {
+                    classes(if (alertFilter == id) AppStyles.filterButtonOn else AppStyles.filterButtonOff)
+                    onClick { onFilterChange(id) }
+                }) { Text("$name ${alertCount(alerts, id)}") }
+            }
+        }
+    }
+}
+
+@Composable
 fun MonitorSectionTitle(
     enabled: Boolean,
     tradingTime: Boolean,
-    refreshSeconds: Int,
     meta: String,
-    onRefreshSecondsChange: (Int) -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit
 ) {
@@ -674,17 +777,7 @@ fun MonitorSectionTitle(
             }
             Span { Text(meta) }
             Span({ classes(AppStyles.monitorIntervalControl) }) {
-                Text("间隔")
-                Input(type = InputType.Number) {
-                    value(refreshSeconds.toString())
-                    attr("min", MONITOR_REFRESH_MIN_SECONDS.toString())
-                    attr("max", MONITOR_REFRESH_MAX_SECONDS.toString())
-                    attr("step", "1")
-                    onInput { event ->
-                        event.value.toString().toIntOrNull()?.let { onRefreshSecondsChange(it) }
-                    }
-                }
-                Text("秒")
+                Text("新浪行情 ${MONITOR_QUOTE_REFRESH_MS / 1_000} 秒")
             }
             Button(attrs = {
                 classes(if (enabled) AppStyles.secondaryButton else AppStyles.primaryButton)
@@ -705,6 +798,9 @@ fun MonitorSourcePanel(
     backendTargetSources: List<String>,
     cooldownSeconds: Int,
     status: String,
+    targetCount: Int,
+    expanded: Boolean,
+    onToggleExpanded: () -> Unit,
     onToggleSource: (String) -> Unit,
     onToggleBackendTarget: (String) -> Unit,
     onCooldownSecondsChange: (Int) -> Unit,
@@ -714,40 +810,50 @@ fun MonitorSourcePanel(
         Div({ classes(AppStyles.sourceHeader) }) {
             Div {
                 H2 { Text("监控来源") }
-                P { Text(status) }
+                P { Text(sourceSummary(backendTargetSources, selectedSources, targetCount, status)) }
             }
             Button(attrs = {
                 classes(AppStyles.secondaryButton)
-                onClick { onRefresh() }
-            }) { Text("刷新来源") }
+                onClick { onToggleExpanded() }
+            }) { Text(if (expanded) "收起来源" else "编辑来源") }
         }
-        Div({ classes(AppStyles.sourceButtons) }) {
-            SourceGroupRow("热榜", monitorSources.filter { it.group == "hot" }, selectedSources, onToggleSource)
-            SourceGroupRow("龙虎榜", monitorSources.filter { it.group == "lhb" }, selectedSources, onToggleSource)
-            BackendTargetRow(
-                "其他",
-                listOf("limit_up" to "涨停", "unusual_today" to "异动", "follow_stock" to "关注个股"),
-                backendTargetSources,
-                onToggleBackendTarget
-            )
-        }
-        Div({ classes(AppStyles.sourceLegend) }) {
-            monitorSources.forEach { source ->
-                SourceIcon(source.name)
+        Div({ classes(AppStyles.sourceSummaryRow) }) {
+            backendTargetSources.forEach { id ->
+                SourceIcon(backendTargetName(id))
             }
+            selectedSources.take(8).forEach { id ->
+                monitorSources.firstOrNull { it.id == id }?.let { SourceIcon(it.name) }
+            }
+            if (selectedSources.size > 8) Span({ classes(AppStyles.statusMeta) }) { Text("+${selectedSources.size - 8}") }
         }
-        Div({ classes(AppStyles.customCodesRow) }) {
-            Span { Text("冷却") }
-            Input(type = InputType.Number) {
-                value(cooldownSeconds.toString())
-                attr("min", "5")
-                attr("max", "3600")
-                attr("step", "5")
-                onInput { event ->
-                    event.value.toString().toIntOrNull()?.let { onCooldownSecondsChange(it) }
+        if (expanded) {
+            Div({ classes(AppStyles.sourceButtons) }) {
+                SourceGroupRow("热榜", monitorSources.filter { it.group == "hot" }, selectedSources, onToggleSource)
+                SourceGroupRow("龙虎榜", monitorSources.filter { it.group == "lhb" }, selectedSources, onToggleSource)
+                BackendTargetRow(
+                    "其他",
+                    listOf("limit_up" to "涨停", "unusual_today" to "异动", "follow_stock" to "关注个股"),
+                    backendTargetSources,
+                    onToggleBackendTarget
+                )
+            }
+            Div({ classes(AppStyles.customCodesRow) }) {
+                Span { Text("冷却") }
+                Input(type = InputType.Number) {
+                    value(cooldownSeconds.toString())
+                    attr("min", "5")
+                    attr("max", "3600")
+                    attr("step", "5")
+                    onInput { event ->
+                        event.value.toString().toIntOrNull()?.let { onCooldownSecondsChange(it) }
+                    }
                 }
+                Span { Text("秒") }
+                Button(attrs = {
+                    classes(AppStyles.secondaryButton)
+                    onClick { onRefresh() }
+                }) { Text("刷新来源") }
             }
-            Span { Text("秒") }
         }
     }
 }
@@ -858,6 +964,7 @@ private fun StockTable(
                 Tr {
                     Th { Text("代码") }
                     Th { Text("名称") }
+                    Th { Text("状态") }
                     Th { Text("来源") }
                     Th { Text("板块") }
                     Th { Text("现价") }
@@ -891,6 +998,7 @@ private fun StockTable(
                                 onClick { onFollowStock(stock) }
                             }) { Text(stock.name) }
                         }
+                        Td { StockActionPill(item) }
                         Td { SourceIconSet(item.source, item.target) }
                         Td {
                             Div({ classes(AppStyles.bkChipSet) }) {
@@ -945,6 +1053,12 @@ private fun StockTable(
 }
 
 @Composable
+private fun StockActionPill(item: MonitorStock) {
+    val label = item.actionLabel()
+    Span({ classes(AppStyles.actionPill) }) { Text(label) }
+}
+
+@Composable
 fun AlertList(alerts: List<AlertEvent>) {
     if (alerts.isEmpty()) {
         Div({ classes(AppStyles.emptyState) }) {
@@ -956,7 +1070,10 @@ fun AlertList(alerts: List<AlertEvent>) {
         alerts.forEach { alert ->
             Div({ classes(AppStyles.alertItem) }) {
                 Div({ classes(AppStyles.alertTop) }) {
-                    Span({ classes(AppStyles.alertTitle) }) { Text("${alert.code} ${alert.name}") }
+                    Div({ classes(AppStyles.alertTitleRow) }) {
+                        AlertEventBadge(alert)
+                        Span({ classes(AppStyles.alertTitle) }) { Text("${alert.code} ${alert.name}") }
+                    }
                     Span({ classes(if (alert.chg >= 0) AppStyles.upText else AppStyles.downText) }) {
                         Text("${alert.chg.fmt()}%")
                     }
@@ -977,6 +1094,11 @@ fun AlertList(alerts: List<AlertEvent>) {
             }
         }
     }
+}
+
+@Composable
+private fun AlertEventBadge(alert: AlertEvent) {
+    Span({ classes(AppStyles.alertBadge) }) { Text(alertEventLabel(alert.primaryEventType())) }
 }
 
 @Composable
@@ -1235,7 +1357,7 @@ private suspend fun loadMonitorSourceMap(selectedSourceIds: List<String>, custom
         .forEach { code -> sourcesByCode.getOrPut(code) { mutableListOf() }.add("自定义") }
     val labelMap = sourcesByCode.mapValues { (_, names) -> names.distinct().joinToString(" / ") }
     val message = buildString {
-        append("已选 ${selectedSourceIds.size} 个来源，命中 ${labelMap.size} 只")
+        append("前端筛选 ${selectedSourceIds.size} 个，列表命中 ${labelMap.size} 只")
         if (errors.isNotEmpty()) append("；").append(errors.joinToString("、"))
     }
     return MonitorSourceLoadResult(labelMap, message)
@@ -1257,16 +1379,86 @@ private suspend fun loadBackendTargetMap(): MonitorSourceLoadResult {
         val map = payload.targets.associate { target ->
             target.code to target.sources.joinToString(" / ")
         }
-        MonitorSourceLoadResult(map, "后端标的 ${map.size} 只", payload.targets.associateBy { it.code })
+        MonitorSourceLoadResult(map, "当前监控池 ${map.size} 只", payload.targets.associateBy { it.code })
     }.getOrElse {
-        MonitorSourceLoadResult(emptyMap(), "后端标的加载失败")
+        MonitorSourceLoadResult(emptyMap(), "监控池加载失败")
     }
 }
 
-private suspend fun loadRecentAlerts(): List<AlertEvent> {
-    val response = window.fetch("http://localhost:8080/api/monitor/alerts?limit=30").await()
+private suspend fun fetchSinaRealtimeTicks(targetCodes: Set<String>): List<StockTick> {
+    val response = window.fetch(
+        "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/" +
+            "Market_Center.getHQNodeDataSimple?page=1&num=6000&sort=symbol&asc=1&node=hs_a&_s_r_a=page"
+    ).await()
     val text = response.text().await()
-    if (!response.ok) kotlin.error("monitor alerts HTTP ${response.status.toInt()}: $text")
+    val rows = JSON.parse<dynamic>(text)
+    val size = rows.length as Int
+    val now = (js("Date.now()") as Double).toLong()
+    return buildList {
+        for (index in 0 until size) {
+            val row = rows[index]
+            val code = row.code?.toString()?.ifBlank { null }
+                ?: row.symbol?.toString().orEmpty()
+                    .removePrefix("sh")
+                    .removePrefix("sz")
+                    .removePrefix("bj")
+            if (code !in targetCodes) continue
+            val name = row.name?.toString().orEmpty()
+            val price = row.trade?.toString()?.toDoubleOrNull() ?: 0.0
+            val previousClose = row.settlement?.toString()?.toDoubleOrNull() ?: 0.0
+            if (code.isBlank() || name.isBlank() || price <= 0.0 || previousClose <= 0.0) continue
+            val chg = row.changepercent?.toString()?.toDoubleOrNull() ?: ((price - previousClose) / previousClose * 100.0)
+            val limit = stockLimitRate(code, name)
+            add(
+                StockTick(
+                    code = code,
+                    name = name,
+                    price = money(price),
+                    chg = percent(chg),
+                    ztPrice = money(previousClose * limit),
+                    dtPrice = money(previousClose * stockDownLimitRate(code, name)),
+                    bk = "",
+                    time = now
+                )
+            )
+        }
+    }
+}
+
+private fun mergeClientStockTick(tick: StockTick, cached: StockTick?): StockTick {
+    if (cached == null) return tick
+    return tick.copy(
+        ztPrice = cached.ztPrice.takeIf { it > 0.0 } ?: tick.ztPrice,
+        dtPrice = cached.dtPrice.takeIf { it > 0.0 } ?: tick.dtPrice,
+        bk = cached.bk.ifBlank { tick.bk }
+    )
+}
+
+private fun stockLimitRate(code: String, name: String): Double {
+    val normalizedName = name.uppercase()
+    if (normalizedName.contains("ST") || normalizedName.contains("*")) return 1.05
+    if (code.startsWith("300") || code.startsWith("301") || code.startsWith("688") || code.startsWith("689")) return 1.20
+    if (code.startsWith("8") || code.startsWith("4") || code.startsWith("92")) return 1.30
+    return 1.10
+}
+
+private fun stockDownLimitRate(code: String, name: String): Double {
+    val normalizedName = name.uppercase()
+    if (normalizedName.contains("ST") || normalizedName.contains("*")) return 0.95
+    if (code.startsWith("300") || code.startsWith("301") || code.startsWith("688") || code.startsWith("689")) return 0.80
+    if (code.startsWith("8") || code.startsWith("4") || code.startsWith("92")) return 0.70
+    return 0.90
+}
+
+private fun money(value: Double): Double = round(value * 100.0) / 100.0
+
+private fun percent(value: Double): Double = round(value * 100.0) / 100.0
+
+private suspend fun loadStockTicks(codes: Set<String>): List<StockTick> {
+    if (codes.isEmpty()) return emptyList()
+    val response = window.fetch("http://localhost:8080/api/stocks?codes=${codes.joinToString(",")}").await()
+    val text = response.text().await()
+    if (!response.ok) kotlin.error("stocks HTTP ${response.status.toInt()}: $text")
     return json.decodeFromString(text)
 }
 
@@ -1398,12 +1590,6 @@ private suspend fun updateMonitorFollow(code: String, type: Int, add: Boolean, n
     }
 }
 
-private fun postMonitorAction(action: String) {
-    val options = js("({})")
-    options.method = "POST"
-    window.fetch("http://localhost:8080/api/monitor/$action", options)
-}
-
 private suspend fun fetchMonitorSourceText(source: MonitorSource): String {
     return runCatching {
         val response = window.fetch(source.url()).await()
@@ -1475,6 +1661,240 @@ private fun StockTick.bkCodes(): List<String> =
         .map { it.trim().uppercase() }
         .filter { it.startsWith("BK") }
         .distinct()
+
+private fun MonitorStock.actionScore(): Int {
+    return when {
+        samePrice(tick.price, tick.ztPrice) -> 90
+        tick.price > 0.0 && tick.ztPrice > 0.0 && tick.price >= tick.ztPrice * 0.985 -> 72
+        tick.chg >= 7.0 -> 56
+        tick.chg <= -5.0 -> 48
+        tick.chg >= 4.0 -> 34
+        else -> 0
+    } + if (source.contains("异动")) 8 else 0
+}
+
+private fun MonitorStock.actionLabel(): String {
+    return when {
+        samePrice(tick.price, tick.ztPrice) -> "封板"
+        tick.price > 0.0 && tick.ztPrice > 0.0 && tick.price >= tick.ztPrice * 0.985 -> "临板"
+        tick.chg >= 7.0 -> "强势"
+        tick.chg <= -5.0 -> "急跌"
+        tick.chg >= 4.0 -> "异动"
+        else -> "观察"
+    }
+}
+
+private fun AlertEvent.primaryEventType(): String {
+    return eventTypes.firstOrNull().orEmpty().ifBlank {
+        when {
+            content.contains("炸板") -> "BREAK_LIMIT_UP"
+            content.contains("涨停") -> "LIMIT_UP"
+            content.contains("跌幅") -> "DROP"
+            content.contains("涨幅") -> "SPIKE"
+            content.contains("跌停") -> "LIMIT_DOWN"
+            content.contains("翘板") -> "OPEN_LIMIT_DOWN"
+            else -> "UNKNOWN"
+        }
+    }
+}
+
+private fun alertEventLabel(type: String): String {
+    return when (type) {
+        "LIMIT_UP" -> "涨停"
+        "BREAK_LIMIT_UP" -> "炸板"
+        "SPIKE" -> "急涨"
+        "DROP" -> "急跌"
+        "LIMIT_DOWN" -> "跌停"
+        "OPEN_LIMIT_DOWN" -> "翘板"
+        else -> "异动"
+    }
+}
+
+private fun alertCount(alerts: List<AlertEvent>, type: String): Int {
+    return if (type == "all") alerts.size else alerts.count { it.primaryEventType() == type }
+}
+
+private fun alertEventSummary(alerts: List<AlertEvent>): String {
+    return "涨停 ${alertCount(alerts, "LIMIT_UP")} / 炸板 ${alertCount(alerts, "BREAK_LIMIT_UP")} / 急涨 ${alertCount(alerts, "SPIKE")} / 急跌 ${alertCount(alerts, "DROP")}"
+}
+
+private fun sourceSummary(
+    backendTargetSources: List<String>,
+    selectedSources: List<String>,
+    targetCount: Int,
+    status: String
+): String {
+    val labels = (backendTargetSources.map(::backendTargetName) + selectedSources.mapNotNull { id ->
+        monitorSources.firstOrNull { it.id == id }?.name
+    }).distinct()
+    val sourceText = labels.takeIf { it.isNotEmpty() }?.joinToString(" + ") ?: "未选择"
+    return "已选来源：$sourceText · 当前监控池 $targetCount 只 · ${status.substringBefore("；").ifBlank { "已同步" }}"
+}
+
+private fun backendTargetName(id: String): String {
+    return when (id) {
+        "limit_up" -> "涨停"
+        "limit_up_today" -> "今日涨停池"
+        "limit_up_yesterday" -> "昨日涨停"
+        "unusual_today" -> "异动"
+        "follow_stock" -> "关注个股"
+        "follow_bk" -> "关注板块"
+        else -> id
+    }
+}
+
+private fun notificationLabel(state: String): String {
+    return when (state) {
+        "granted" -> "已开启"
+        "denied" -> "已关闭"
+        "unsupported" -> "不支持"
+        else -> "未授权"
+    }
+}
+
+private fun notificationHelp(state: String): String {
+    return when (state) {
+        "granted" -> "浏览器弹窗可用"
+        "denied" -> "地址栏允许通知后生效"
+        "unsupported" -> "当前浏览器不可用"
+        else -> "点击右上角开启"
+    }
+}
+
+private fun samePrice(left: Double, right: Double): Boolean =
+    kotlin.math.abs(left - right) < 0.001
+
+private data class ClientAlertCandidate(
+    val stock: StockTick,
+    val events: List<ClientAlertSignal>
+) {
+    val eventTypes: List<String> get() = events.map { it.eventType }
+
+    fun toAlert(
+        allowedTypes: List<String>,
+        sources: List<String>,
+        replay: ZtReplayItem?
+    ): AlertEvent {
+        val allowed = events.filter { it.eventType in allowedTypes }
+        val reasons = allowed.map { it.reason }
+        val types = allowed.map { it.eventType }.distinct()
+        return AlertEvent(
+            code = stock.code,
+            name = stock.name,
+            title = "${stock.code}${stock.name}异动,涨跌幅${stock.chg.fmt()}%",
+            content = reasons.joinToString(" "),
+            chg = stock.chg,
+            price = stock.price,
+            time = stock.time,
+            reasons = reasons,
+            sources = sources,
+            eventTypes = types,
+            replay = replay
+        )
+    }
+}
+
+private data class ClientAlertSignal(
+    val eventType: String,
+    val reason: String
+)
+
+private class ClientMonitorTracker {
+    private val cache = mutableListOf<StockTick>()
+    private val speedStrategy = ClientSpeedMonitorStrategy()
+
+    fun update(stock: StockTick): ClientAlertCandidate? {
+        val events = mutableListOf<ClientAlertSignal>()
+        val last = cache.lastOrNull()
+        if (last != null) {
+            if (samePrice(stock.ztPrice, stock.price) && !samePrice(last.price, last.ztPrice)) {
+                events += ClientAlertSignal("LIMIT_UP", "[涨停]")
+            }
+            if (samePrice(last.ztPrice, last.price) && stock.price < stock.ztPrice) {
+                events += ClientAlertSignal("BREAK_LIMIT_UP", "[炸板]")
+            }
+            if (samePrice(stock.dtPrice, stock.price) && !samePrice(last.price, last.dtPrice)) {
+                events += ClientAlertSignal("LIMIT_DOWN", "[跌停]")
+            }
+            if (samePrice(last.dtPrice, last.price) && stock.price > stock.dtPrice) {
+                events += ClientAlertSignal("OPEN_LIMIT_DOWN", "[翘板]")
+            }
+            events += speedStrategy.evaluate(cache, stock)
+        }
+        cache += stock
+        if (cache.size > 80) cache.removeAt(0)
+        return events.takeIf { it.isNotEmpty() }?.let { ClientAlertCandidate(stock, it) }
+    }
+}
+
+private class ClientSpeedMonitorStrategy {
+    private val windows = listOf(
+        ClientSpeedWindow(0..15, 0.5),
+        ClientSpeedWindow(15..60, 1.0),
+        ClientSpeedWindow(61..90, 1.5),
+        ClientSpeedWindow(91..180, 2.0)
+    )
+
+    fun evaluate(cache: List<StockTick>, current: StockTick): List<ClientAlertSignal> {
+        if (cache.isEmpty()) return emptyList()
+        return buildList {
+            windows.forEach { window ->
+                bestRiseSignal(cache, current, window)?.let { add(it) }
+                bestDropSignal(cache, current, window)?.let { add(it) }
+            }
+        }
+    }
+
+    private fun bestRiseSignal(cache: List<StockTick>, current: StockTick, window: ClientSpeedWindow): ClientAlertSignal? {
+        val anchor = bestAnchor(cache, current, window) { previous -> current.chg - previous.chg } ?: return null
+        val seconds = elapsedSeconds(current, anchor)
+        val delta = current.chg - anchor.chg
+        if (delta < window.minDeltaChg) return null
+        return ClientAlertSignal(
+            eventType = "SPIKE",
+            reason = "${seconds}秒内涨速+${delta.fmt()}% (${anchor.chg.fmt()}%→${current.chg.fmt()}%)"
+        )
+    }
+
+    private fun bestDropSignal(cache: List<StockTick>, current: StockTick, window: ClientSpeedWindow): ClientAlertSignal? {
+        val anchor = bestAnchor(cache, current, window) { previous -> previous.chg - current.chg } ?: return null
+        val seconds = elapsedSeconds(current, anchor)
+        val delta = anchor.chg - current.chg
+        if (delta < window.minDeltaChg) return null
+        return ClientAlertSignal(
+            eventType = "DROP",
+            reason = "${seconds}秒内跌速-${delta.fmt()}% (${anchor.chg.fmt()}%→${current.chg.fmt()}%)"
+        )
+    }
+
+    private fun bestAnchor(
+        cache: List<StockTick>,
+        current: StockTick,
+        window: ClientSpeedWindow,
+        score: (StockTick) -> Double
+    ): StockTick? {
+        var best: StockTick? = null
+        var bestScore = Double.NEGATIVE_INFINITY
+        cache.forEach { previous ->
+            if (elapsedSeconds(current, previous) !in window.secondsRange) return@forEach
+            val value = score(previous)
+            if (value > bestScore) {
+                best = previous
+                bestScore = value
+            }
+        }
+        return best
+    }
+
+    private fun elapsedSeconds(current: StockTick, previous: StockTick): Int {
+        return ((current.time - previous.time) / 1000).toInt().coerceAtLeast(0)
+    }
+}
+
+private data class ClientSpeedWindow(
+    val secondsRange: IntRange,
+    val minDeltaChg: Double
+)
 
 private fun sourceIconClass(sourceName: String): String {
     return when {
@@ -1587,6 +2007,41 @@ object AppStyles : StyleSheet() {
         gap(16.px)
     }
 
+    val dashboardGrid by style {
+        display(DisplayStyle.Grid)
+        property("grid-template-columns", "repeat(auto-fit, minmax(180px, 1fr))")
+        gap(10.px)
+        margin(0.px, 0.px, 12.px, 0.px)
+    }
+
+    val statusTile by style {
+        background("#ffffff")
+        borderRadius(8.px)
+        border(1.px, LineStyle.Solid, Color("#dfe5ec"))
+        padding(12.px)
+        display(DisplayStyle.Flex)
+        flexDirection(FlexDirection.Column)
+        gap(4.px)
+        boxSizing("border-box")
+    }
+
+    val statusLabel by style {
+        color(Color("#66707c"))
+        fontSize(12.px)
+        fontWeight("700")
+    }
+
+    val statusValue by style {
+        color(Color("#20242a"))
+        fontSize(20.px)
+        fontWeight("800")
+    }
+
+    val statusMeta by style {
+        color(Color("#66707c"))
+        fontSize(12.px)
+    }
+
     val panel by style {
         background("#ffffff")
         borderRadius(8.px)
@@ -1688,6 +2143,34 @@ object AppStyles : StyleSheet() {
         property("overflow", "hidden")
     }
 
+    val alertHeader by style {
+        display(DisplayStyle.Flex)
+        justifyContent(JustifyContent.SpaceBetween)
+        alignItems(AlignItems.FlexStart)
+        gap(12.px)
+        margin(0.px, 0.px, 12.px, 0.px)
+        property("flex-wrap", "wrap")
+    }
+
+    val filterBar by style {
+        display(DisplayStyle.Flex)
+        gap(6.px)
+        property("flex-wrap", "wrap")
+        justifyContent(JustifyContent.FlexEnd)
+    }
+
+    val filterButtonOn by style {
+        button("#20242a", "#ffffff")
+        padding(6.px, 9.px)
+        fontSize(12.px)
+    }
+
+    val filterButtonOff by style {
+        button("#f1f5f9", "#334155")
+        padding(6.px, 9.px)
+        fontSize(12.px)
+    }
+
     val alertItem by style {
         border(1.px, LineStyle.Solid, Color("#e3e7ec"))
         borderRadius(8.px)
@@ -1699,6 +2182,21 @@ object AppStyles : StyleSheet() {
         display(DisplayStyle.Flex)
         justifyContent(JustifyContent.SpaceBetween)
         gap(8.px)
+    }
+
+    val alertTitleRow by style {
+        display(DisplayStyle.Flex)
+        alignItems(AlignItems.Center)
+        gap(8.px)
+    }
+
+    val alertBadge by style {
+        background("#20242a")
+        color(Color.white)
+        borderRadius(6.px)
+        padding(3.px, 6.px)
+        fontSize(12.px)
+        fontWeight("800")
     }
 
     val alertTitle by style {
@@ -1732,7 +2230,7 @@ object AppStyles : StyleSheet() {
     }
 
     val sourcePanel by style {
-        margin(0.px, 0.px, 16.px, 0.px)
+        margin(0.px, 0.px, 12.px, 0.px)
         background("#ffffff")
         borderRadius(8.px)
         border(1.px, LineStyle.Solid, Color("#dfe5ec"))
@@ -1749,6 +2247,13 @@ object AppStyles : StyleSheet() {
         alignItems(AlignItems.Center)
         gap(12.px)
         property("flex-wrap", "wrap")
+    }
+
+    val sourceSummaryRow by style {
+        display(DisplayStyle.Flex)
+        gap(6.px)
+        property("flex-wrap", "wrap")
+        alignItems(AlignItems.Center)
     }
 
     val sourceButtons by style {
@@ -1831,6 +2336,16 @@ object AppStyles : StyleSheet() {
         button("#e8eef6", "#1f2937")
         padding(4.px, 6.px)
         fontSize(12.px)
+    }
+
+    val actionPill by style {
+        background("#eef2f7")
+        color(Color("#253040"))
+        borderRadius(6.px)
+        padding(4.px, 7.px)
+        fontSize(12.px)
+        fontWeight("800")
+        property("white-space", "nowrap")
     }
 
     val followGroupTitle by style {

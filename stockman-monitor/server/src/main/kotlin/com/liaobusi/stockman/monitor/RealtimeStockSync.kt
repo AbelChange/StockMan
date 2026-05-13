@@ -7,19 +7,28 @@ import com.liaobusi.stockman.monitor.sync.strategy.SinaRealtimeStockStrategy
 import com.liaobusi.stockman.monitor.sync.strategy.fetchFirstSuccessfulSnapshot
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import org.slf4j.LoggerFactory
 import java.time.LocalDateTime
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 
 class RealtimeStockSync(private val database: StockDatabase) {
-    private val eastMoneyApi = MarketApiFactory.eastMoneyRealtimeApi()
+    private val logger = LoggerFactory.getLogger(RealtimeStockSync::class.java)
+    private val eastMoneyPrimaryApi = MarketApiFactory.eastMoneyRealtimeApi("43.push2.eastmoney.com")
+    private val eastMoneyFallbackApi = MarketApiFactory.eastMoneyRealtimeApi("52.push2.eastmoney.com")
     private val sinaApi = MarketApiFactory.sinaApi()
+    private val refreshMutex = Mutex()
 
     private val realtimeSnapshotStrategies: List<RealtimeStockStrategy> = listOf(
         SinaRealtimeStockStrategy(sinaApi)
     )
-    private val eastMoneyCloseSnapshotStrategy = EastMoneyRealtimeStockStrategy(eastMoneyApi)
+    private val eastMoneySnapshotStrategies: List<RealtimeStockStrategy> = listOf(
+        EastMoneyRealtimeStockStrategy(eastMoneyPrimaryApi, name = "EastMoney43"),
+        EastMoneyRealtimeStockStrategy(eastMoneyFallbackApi, name = "EastMoney52")
+    )
 
     suspend fun refreshRealtimeStocks(source: RealtimeRefreshSource, retry: Boolean = false): SyncStatus {
         return when (source) {
@@ -28,23 +37,66 @@ class RealtimeStockSync(private val database: StockDatabase) {
         }
     }
 
-    suspend fun refreshRealtimeStocks(retry: Boolean = true): SyncStatus = withContext(Dispatchers.IO) {
-        val snapshot = if (retry) {
-            retryWithExponentialBackoff { fetchFirstSuccessfulSnapshot(realtimeSnapshotStrategies) }
-        } else {
-            fetchFirstSuccessfulSnapshot(realtimeSnapshotStrategies)
+    suspend fun fetchRealtimeTicks(retry: Boolean = false): List<StockTick> = withContext(Dispatchers.IO) {
+        refreshMutex.withLock {
+            val startedAt = System.currentTimeMillis()
+            val snapshot = if (retry) {
+                retryWithExponentialBackoff { fetchFirstSuccessfulSnapshot(realtimeSnapshotStrategies) }
+            } else {
+                fetchFirstSuccessfulSnapshot(realtimeSnapshotStrategies)
+            }
+            val now = System.currentTimeMillis()
+            val ticks = snapshot.stocks.distinctBy { it.code }.map { stock ->
+                StockTick(
+                    code = stock.code,
+                    name = stock.name,
+                    price = stock.price,
+                    chg = stock.chg,
+                    ztPrice = stock.ztPrice,
+                    dtPrice = stock.dtPrice,
+                    bk = stock.bk,
+                    time = now
+                )
+            }
+            check(ticks.size > FULL_MARKET_STOCK_MIN_COUNT) { "realtime stock snapshot is incomplete: ${ticks.size}" }
+            logger.debug(
+                "Realtime stock tick fetch completed: source={}, count={}, elapsedMs={}",
+                snapshot.source,
+                ticks.size,
+                System.currentTimeMillis() - startedAt
+            )
+            ticks
         }
-        val stocks = snapshot.stocks.distinctBy { it.code }
-        check(stocks.size > FULL_MARKET_STOCK_MIN_COUNT) { "realtime stock snapshot is incomplete: ${stocks.size}" }
-        val syncDate = resolveRealtimeTradingDate(snapshot.date)
-        database.replaceStocksFromSync(
-            stocks = stocks,
-            date = syncDate,
-            clearBeforeInsert = false,
-            source = snapshot.source,
-            preserveExistingBk = true
-        )
-        database.syncStatus()
+    }
+
+    suspend fun refreshRealtimeStocks(retry: Boolean = true): SyncStatus = withContext(Dispatchers.IO) {
+        refreshMutex.withLock {
+            val startedAt = System.currentTimeMillis()
+            val snapshot = if (retry) {
+                retryWithExponentialBackoff { fetchFirstSuccessfulSnapshot(realtimeSnapshotStrategies) }
+            } else {
+                fetchFirstSuccessfulSnapshot(realtimeSnapshotStrategies)
+            }
+            val stocks = snapshot.stocks.distinctBy { it.code }
+            check(stocks.size > FULL_MARKET_STOCK_MIN_COUNT) { "realtime stock snapshot is incomplete: ${stocks.size}" }
+            val syncDate = resolveRealtimeTradingDate(snapshot.date)
+            database.replaceStocksFromSync(
+                stocks = stocks,
+                date = syncDate,
+                clearBeforeInsert = false,
+                source = snapshot.source,
+                preserveExistingBk = true
+            )
+            database.syncStatus().also {
+                logger.info(
+                    "Realtime stock sync completed: source={}, count={}, date={}, elapsedMs={}",
+                    snapshot.source,
+                    stocks.size,
+                    syncDate,
+                    System.currentTimeMillis() - startedAt
+                )
+            }
+        }
     }
 
     suspend fun refreshRealtimeStocksIfScheduled(): SyncStatus? {
@@ -80,21 +132,32 @@ class RealtimeStockSync(private val database: StockDatabase) {
     }
 
     suspend fun refreshEastMoneyRealtimeStocks(updateBk: Boolean, retry: Boolean = true): SyncStatus = withContext(Dispatchers.IO) {
-        val snapshot = if (retry) {
-            retryWithExponentialBackoff { eastMoneyCloseSnapshotStrategy.fetchSnapshot() }
-        } else {
-            eastMoneyCloseSnapshotStrategy.fetchSnapshot()
+        refreshMutex.withLock {
+            val startedAt = System.currentTimeMillis()
+            val snapshot = if (retry) {
+                retryWithExponentialBackoff { fetchFirstSuccessfulSnapshot(eastMoneySnapshotStrategies) }
+            } else {
+                fetchFirstSuccessfulSnapshot(eastMoneySnapshotStrategies)
+            }
+            val stocks = snapshot.stocks.distinctBy { it.code }
+            check(stocks.size > FULL_MARKET_STOCK_MIN_COUNT) { "eastmoney close snapshot is incomplete: ${stocks.size}" }
+            database.replaceStocksFromSync(
+                stocks = stocks,
+                date = resolveRealtimeTradingDate(snapshot.date),
+                clearBeforeInsert = updateBk,
+                source = snapshot.source,
+                preserveExistingBk = !updateBk
+            )
+            database.syncStatus().also {
+                logger.info(
+                    "EastMoney realtime stock sync completed: source={}, count={}, updateBk={}, elapsedMs={}",
+                    snapshot.source,
+                    stocks.size,
+                    updateBk,
+                    System.currentTimeMillis() - startedAt
+                )
+            }
         }
-        val stocks = snapshot.stocks.distinctBy { it.code }
-        check(stocks.size > FULL_MARKET_STOCK_MIN_COUNT) { "eastmoney close snapshot is incomplete: ${stocks.size}" }
-        database.replaceStocksFromSync(
-            stocks = stocks,
-            date = resolveRealtimeTradingDate(snapshot.date),
-            clearBeforeInsert = updateBk,
-            source = snapshot.source,
-            preserveExistingBk = !updateBk
-        )
-        database.syncStatus()
     }
 
     private fun currentSlot(time: LocalTime): String? {

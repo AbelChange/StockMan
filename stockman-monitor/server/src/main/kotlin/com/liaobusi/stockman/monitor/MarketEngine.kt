@@ -1,9 +1,6 @@
 package com.liaobusi.stockman.monitor
 
 import com.liaobusi.stockman.monitor.network.MarketApiFactory
-import io.ktor.websocket.DefaultWebSocketSession
-import io.ktor.websocket.Frame
-import io.ktor.websocket.send
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -11,7 +8,6 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonPrimitive
@@ -21,7 +17,6 @@ import okhttp3.Request
 import org.slf4j.LoggerFactory
 import java.time.LocalDateTime
 import java.time.LocalTime
-import java.util.Collections
 import kotlin.math.sin
 import kotlin.random.Random
 
@@ -30,7 +25,6 @@ class MarketEngine {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val json = Json { encodeDefaults = true; ignoreUnknownKeys = true }
     private val unusualClient = OkHttpClient()
-    private val sessions = Collections.synchronizedSet(mutableSetOf<DefaultWebSocketSession>())
     private val seeds = listOf(
         StockSeed("600519", "贵州茅台", 1688.00, baseChg = 0.2, circulationMarketValue = 18200.0, toMarketTime = 20010827, bk = "白酒,消费"),
         StockSeed("300750", "宁德时代", 192.40, limitRate = 0.2, baseChg = -0.1, circulationMarketValue = 8200.0, toMarketTime = 20180611, bk = "锂电池,新能源车"),
@@ -42,10 +36,8 @@ class MarketEngine {
     private val realtimeStockSync = RealtimeStockSync(database)
     private val historyStockSync = HistoryStockSync(database)
     private val thsApi = MarketApiFactory.thsApi()
-    private val trackers = mutableMapOf<String, Tracker>()
-    private val lastAlertByCodeAndType = mutableMapOf<String, Long>()
+    private val stockLock = Any()
     private val stocks: MutableMap<String, StockTick>
-    private val alerts = ArrayDeque<AlertEvent>()
     private var step = 0
     @Volatile private var historyProgress = HistorySyncProgress()
     @Volatile private var stopHistorySyncRequested = false
@@ -55,12 +47,11 @@ class MarketEngine {
         database.initialize(seeds)
         logger.info("MarketEngine initialized: database={}", database.path())
         stocks = database.getStocks().associateBy { it.code }.toMutableMap()
-        reloadTrackersForTargets()
         scope.launch {
             runCatching { realtimeStockSync.initializeRealtimeStocksIfEmpty() }
                 .onSuccess { status ->
                     if (status != null) {
-                        reloadStocksAndBroadcast()
+                        reloadStocksFromDatabase()
                     }
                 }
                 .onFailure { logger.warn("Stock sync failed: {}", it.message) }
@@ -68,61 +59,31 @@ class MarketEngine {
         scope.launch {
             while (isActive) {
                 delay(60_000)
-                val result = runCatching { realtimeStockSync.refreshRealtimeStocksIfScheduled() }
-                result.onFailure { logger.warn("Stock sync failed: {}", it.message) }
-                val status = result.getOrNull()
-                if (status != null) {
-                    reloadStocksAndBroadcast()
-                }
-                val eastMoneyStatus = runCatching { realtimeStockSync.refreshEastMoneyRealtimeStocksIfScheduled() }
-                    .onFailure { logger.warn("Scheduled EastMoney realtime stock sync failed: {}", it.message) }
-                    .getOrNull()
-                if (eastMoneyStatus != null) {
-                    reloadStocksAndBroadcast()
-                }
                 syncHistoryFromRealtimeSnapshotAfterClose()
             }
         }
         scope.launch {
             while (isActive) {
-                delay(MONITOR_REALTIME_REFRESH_INTERVAL_MS)
-                if (!shouldRefreshRealtimeForMonitor()) continue
-                val status = runCatching { realtimeStockSync.refreshRealtimeStocks(retry = false) }
-                    .onFailure { logger.warn("Monitor realtime stock sync failed: {}", it.message) }
-                    .getOrNull()
-                if (status != null) {
-                    reloadStocksAndBroadcast()
-                }
-            }
-        }
-        scope.launch {
-            while (isActive) {
                 delay(1000)
-                if (stocks.size <= seeds.size) {
+                if (currentStockCount() <= seeds.size) {
                     simulate()
-                    broadcast(ClientMessage(type = "stocks", stocks = stocks.values.sortedBy { it.code }))
                 }
             }
-        }
-    }
-
-    suspend fun connect(session: DefaultWebSocketSession) {
-        sessions.add(session)
-        session.send(json.encodeToString(ClientMessage(type = "snapshot", stocks = stocks.values.sortedBy { it.code })))
-        try {
-            for (frame in session.incoming) {
-                if (frame is Frame.Close) break
-            }
-        } finally {
-            sessions.remove(session)
         }
     }
 
     fun snapshot(): MonitorSnapshot {
         return MonitorSnapshot(
-            stocks = stocks.values.sortedBy { it.code },
-            alerts = alerts.toList().asReversed()
+            stocks = currentStocksSorted(),
+            alerts = emptyList()
         )
+    }
+
+    fun stockTicks(codes: Set<String>): List<StockTick> {
+        if (codes.isEmpty()) return emptyList()
+        return synchronized(stockLock) {
+            codes.mapNotNull { stocks[it] }.sortedBy { it.code }
+        }
     }
 
     suspend fun manualTick(request: ManualTickRequest): StockTick? {
@@ -133,7 +94,6 @@ class MarketEngine {
             else -> return null
         }
         accept(tick, persistSeed = true)
-        broadcast(ClientMessage(type = "stocks", stocks = stocks.values.sortedBy { it.code }))
         return tick
     }
 
@@ -141,7 +101,7 @@ class MarketEngine {
         val refreshSource = RealtimeRefreshSource.from(source)
         logger.info("Manual realtime stock sync requested: source={}", refreshSource)
         val status = realtimeStockSync.refreshRealtimeStocks(source = refreshSource, retry = false)
-        reloadStocksAndBroadcast()
+        reloadStocksFromDatabase()
         logger.info("Manual realtime stock sync completed: count={}, source={}", status.lastStockSyncCount, status.lastStockSyncSource)
         return status
     }
@@ -204,14 +164,11 @@ class MarketEngine {
     fun monitorConfig(): MonitorConfig = database.monitorConfig()
 
     fun saveMonitorConfig(request: MonitorConfigRequest): MonitorConfig {
-        val config = database.saveMonitorConfig(request)
-        reloadTrackersForTargets(config)
-        return config
+        return database.saveMonitorConfig(request)
     }
 
     fun startMonitor(): MonitorStatus {
         val config = database.saveMonitorConfig(MonitorConfigRequest(enabled = true))
-        reloadTrackersForTargets(config)
         return monitorStatus(config)
     }
 
@@ -227,40 +184,30 @@ class MarketEngine {
             running = config.enabled && (!config.tradingTimeOnly || isTradingSession()),
             tradingTime = isTradingSession(),
             targetCount = targets.size,
-            alertCount = database.monitorAlertCount(),
+            alertCount = 0,
             lastMessage = if (config.enabled) "监控已开启" else "监控已停止"
         )
     }
 
     fun monitorTargets(): MonitorTargetsResponse = database.monitorTargets()
 
-    fun monitorAlerts(code: String? = null, date: Int? = null, limit: Int = 100): List<AlertEvent> =
-        database.monitorAlerts(code = code, date = date, limit = limit)
-
     fun monitorFollows(): List<MonitorFollowItem> = database.monitorFollows()
 
     fun upsertMonitorFollow(request: MonitorFollowRequest): MonitorTarget {
-        val target = database.upsertMonitorFollow(request)
-        reloadTrackersForTargets()
-        return target
+        return database.upsertMonitorFollow(request)
     }
 
     fun removeMonitorFollow(code: String, type: Int): Map<String, Int> {
         val deleted = database.removeMonitorFollow(code, type)
-        reloadTrackersForTargets()
         return mapOf("deleted" to deleted)
     }
 
     fun upsertBkStocks(request: MonitorBkStocksRequest): SyncWriteResult {
-        val result = database.upsertBkStocks(request)
-        reloadTrackersForTargets()
-        return result
+        return database.upsertBkStocks(request)
     }
 
     fun insertUnusualAction(request: MonitorUnusualRequest): SyncWriteResult {
-        val result = database.insertUnusualAction(request)
-        reloadTrackersForTargets()
-        return result
+        return database.insertUnusualAction(request)
     }
 
     suspend fun syncLimitUpPool(date: Int = ChinaMarketCalendar.currentHistoryTargetDate()): SyncWriteResult {
@@ -293,7 +240,6 @@ class MarketEngine {
             page += 1
         }
         val result = database.upsertLimitUpPool(items.distinctBy { it.date to it.code }, source = "THS")
-        reloadTrackersForTargets()
         return result
     }
 
@@ -318,7 +264,6 @@ class MarketEngine {
             }
         }
         val result = database.upsertZtReplay(items.distinctBy { it.date to it.code }, source = "THS")
-        reloadTrackersForTargets()
         return result
     }
 
@@ -360,7 +305,6 @@ class MarketEngine {
             )
         }
         val result = database.upsertUnusualActions(rows, source = "KPL")
-        reloadTrackersForTargets()
         return result
     }
 
@@ -396,7 +340,7 @@ class MarketEngine {
     private suspend fun simulate() {
         step += 1
         seeds.forEachIndexed { index, seed ->
-            val previous = stocks.getValue(seed.code)
+            val previous = synchronized(stockLock) { stocks.getValue(seed.code) }
             val wave = sin((step + index * 9) / 7.0) * 0.35
             val noise = Random.nextDouble(-0.12, 0.12)
             val pulse = when {
@@ -414,53 +358,28 @@ class MarketEngine {
     }
 
     private suspend fun accept(tick: StockTick, persistSeed: Boolean = false) {
-        stocks[tick.code] = tick
+        synchronized(stockLock) {
+            stocks[tick.code] = tick
+        }
         if (persistSeed) seeds.firstOrNull { it.code == tick.code }?.let { seed ->
             database.upsertTick(seed, tick)
         }
-        val config = database.monitorConfig()
-        if (!config.enabled) return
-        if (config.tradingTimeOnly && !isTradingSession()) return
-        val target = database.monitorTargets(config).targets.firstOrNull { it.code == tick.code } ?: return
-        val baseAlert = trackers.getOrPut(tick.code) { Tracker() }.update(tick) ?: return
-        val eventTypes = baseAlert.eventTypes.ifEmpty { listOf("UNKNOWN") }
-        val now = System.currentTimeMillis()
-        val allowedTypes = eventTypes.filter { type ->
-            val key = "${tick.code}:$type"
-            val previous = lastAlertByCodeAndType[key] ?: 0L
-            now - previous >= config.cooldownSeconds * 1000L
-        }
-        if (allowedTypes.isEmpty()) return
-        allowedTypes.forEach { type -> lastAlertByCodeAndType["${tick.code}:$type"] = now }
-        val alert = baseAlert.copy(
-            sources = target.sources,
-            replay = target.replay,
-            eventTypes = allowedTypes
-        )
-        database.insertMonitorAlert(alert)
-        alerts.addLast(alert)
-        while (alerts.size > 50) alerts.removeFirst()
-        broadcast(ClientMessage(type = "alert", alert = alert))
     }
 
-    private suspend fun broadcast(message: ClientMessage) {
-        val payload = json.encodeToString(message)
-        sessions.toList().forEach { session ->
-            runCatching { session.send(payload) }.onFailure { sessions.remove(session) }
+    private fun reloadStocksFromDatabase() {
+        val syncedStocks = database.getStocks().sortedBy { it.code }
+        synchronized(stockLock) {
+            stocks.clear()
+            stocks.putAll(syncedStocks.associateBy { it.code })
         }
     }
 
-    private suspend fun reloadStocksAndBroadcast() {
-        stocks.clear()
-        stocks.putAll(database.getStocks().associateBy { it.code })
-        stocks.values.forEach { accept(it, persistSeed = false) }
-        broadcast(ClientMessage(type = "stocks", stocks = stocks.values.sortedBy { it.code }))
+    private fun currentStocksSorted(): List<StockTick> {
+        return synchronized(stockLock) { stocks.values.sortedBy { it.code } }
     }
 
-    private fun reloadTrackersForTargets(config: MonitorConfig = database.monitorConfig()) {
-        val targetCodes = database.monitorTargets(config).targets.map { it.code }.toSet()
-        trackers.keys.retainAll(targetCodes)
-        targetCodes.forEach { code -> trackers.getOrPut(code) { Tracker() } }
+    private fun currentStockCount(): Int {
+        return synchronized(stockLock) { stocks.size }
     }
 
     private fun isTradingSession(now: LocalDateTime = LocalDateTime.now(RealtimeStockSync.CHINA_ZONE)): Boolean {
@@ -468,11 +387,6 @@ class MarketEngine {
         val time = now.toLocalTime()
         return (time > LocalTime.of(9, 30) && time < LocalTime.of(11, 30)) ||
             (time >= LocalTime.of(13, 0) && time < LocalTime.of(15, 0))
-    }
-
-    private fun shouldRefreshRealtimeForMonitor(): Boolean {
-        val config = database.monitorConfig()
-        return config.enabled && isTradingSession()
     }
 
     private fun formatLimitUpTime(value: Long?): String {
@@ -484,8 +398,4 @@ class MarketEngine {
 
     private fun normalizeStockCodeLoose(value: String): String? =
         Regex("\\d{6}").find(value)?.value
-
-    companion object {
-        private const val MONITOR_REALTIME_REFRESH_INTERVAL_MS = 10_000L
-    }
 }

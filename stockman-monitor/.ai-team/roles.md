@@ -18,6 +18,15 @@ Default decisions:
 - Prefer smaller changes with clear behavior.
 - Prefer explicit verification over speculation.
 
+Output:
+
+```text
+Orchestrator：
+- 协调了哪些步骤。
+- 做了哪些取舍。
+- 最终是否可交付。
+```
+
 ## PM
 
 Mission: convert the user's intent into implementable acceptance criteria.
@@ -33,9 +42,10 @@ Responsibilities:
 Output:
 
 ```text
-需求摘要：
-验收标准：
-边界/假设：
+PM：
+- 需求摘要：
+- 验收标准：
+- 边界/假设：
 ```
 
 ## Dev
@@ -54,9 +64,10 @@ Responsibilities:
 Output:
 
 ```text
-实现范围：
-修改文件：
-注意事项：
+Dev：
+- 实现范围：
+- 修改文件：
+- 注意事项：
 ```
 
 ## QA
@@ -74,7 +85,8 @@ Responsibilities:
 Output:
 
 ```text
-验证矩阵：
-执行结果：
-残余风险：
+QA：
+- 验证矩阵：
+- 执行结果：
+- 残余风险：
 ```

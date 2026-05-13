@@ -20,6 +20,9 @@ import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlin.math.ceil
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 
 private val realtimeStrategyLogger = LoggerFactory.getLogger("RealtimeStockStrategies")
@@ -73,16 +76,22 @@ suspend fun fetchFirstSuccessfulSnapshot(strategies: List<RealtimeStockStrategy>
     error("All stock sync strategies failed: ${errors.joinToString(" | ")}")
 }
 
-class EastMoneyRealtimeStockStrategy(private val api: EastMoneyApi) : RealtimeStockStrategy {
+class EastMoneyRealtimeStockStrategy(
+    private val api: EastMoneyApi,
     override val name: String = "EastMoney"
+) : RealtimeStockStrategy {
     private val request = PagedRequestConfig(
         name = name,
         pageParam = "pn",
         pageSizeParam = "pz",
-        pageSize = 200,
+        pageSize = 100,
         preservePlusInQueryValues = true,
         fixedQuery = mapOf(
+            "po" to "1",
             "np" to "1",
+            "ut" to "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt" to "1",
+            "invt" to "2",
             "fid" to "f3",
             "fields" to "f2,f3,f7,f8,f12,f14,f15,f16,f17,f18,f21,f26,f297,f350,f351,f352,f383",
             "fs" to "m:1+t:2,m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:23,t:81+s:2048"
@@ -91,22 +100,39 @@ class EastMoneyRealtimeStockStrategy(private val api: EastMoneyApi) : RealtimeSt
 
     override suspend fun fetchSnapshot(): RealtimeStockSnapshot {
         val pageSize = request.pageSize
-        val first = fetchPage(page = 1, pageSize = pageSize)
+        val first = fetchPageWithRetry(page = 1, pageSize = pageSize)
         val total = first.total
         val effectivePageSize = first.stocks.size.takeIf { it > 0 } ?: pageSize
         val pages = ceil(total / effectivePageSize.toDouble()).toInt().coerceAtLeast(1)
         val all = first.stocks.toMutableList()
         var date = first.date
 
-        for (page in 2..pages) {
-            delay(250)
-            val next = fetchPage(page = page, pageSize = pageSize)
-            all.addAll(next.stocks)
-            if (next.date > 0) date = next.date
+        for (chunk in (2..pages).chunked(EAST_MONEY_PARALLEL_PAGES)) {
+            delay(300)
+            val pageResults = coroutineScope {
+                chunk.map { page ->
+                    async { fetchPageWithRetry(page = page, pageSize = pageSize) }
+                }.awaitAll()
+            }
+            pageResults.forEach { next ->
+                all.addAll(next.stocks)
+                if (next.date > 0) date = next.date
+            }
         }
 
         check(all.size > FULL_MARKET_STOCK_MIN_COUNT) { "$name returned too few stocks: ${all.size}" }
         return RealtimeStockSnapshot(name, date = date.safeSyncDate(), stocks = all)
+    }
+
+    private suspend fun fetchPageWithRetry(page: Int, pageSize: Int): EastMoneyPage {
+        var lastError: Throwable? = null
+        repeat(EAST_MONEY_PAGE_ATTEMPTS) { index ->
+            val result = runCatching { fetchPage(page = page, pageSize = pageSize) }
+            if (result.isSuccess) return result.getOrThrow()
+            lastError = result.exceptionOrNull()
+            delay(300L * (index + 1))
+        }
+        throw lastError ?: IllegalStateException("$name page $page failed")
     }
 
     private suspend fun fetchPage(page: Int, pageSize: Int): EastMoneyPage {
@@ -158,6 +184,11 @@ class EastMoneyRealtimeStockStrategy(private val api: EastMoneyApi) : RealtimeSt
         val date: Int,
         val stocks: List<SyncedStock>
     )
+
+    private companion object {
+        const val EAST_MONEY_PARALLEL_PAGES = 1
+        const val EAST_MONEY_PAGE_ATTEMPTS = 3
+    }
 }
 
 class SinaRealtimeStockStrategy(private val api: SinaApi) : RealtimeStockStrategy {
@@ -167,7 +198,7 @@ class SinaRealtimeStockStrategy(private val api: SinaApi) : RealtimeStockStrateg
         pageParam = "page",
         pageSizeParam = "num",
         pageStart = 1,
-        pageSize = 3000,
+        pageSize = 6000,
         fixedQuery = mapOf(
             "sort" to "symbol",
             "asc" to "1",
@@ -336,7 +367,7 @@ class SseRealtimeStockStrategy(private val api: SseApi) : RealtimeStockStrategy 
 
 private fun Map<String, String>.encodeValuesPreservingPlusIfNeeded(enabled: Boolean): Map<String, String> {
     if (!enabled) return this
-    return mapValues { (_, value) -> URLEncoder.encode(value, Charsets.UTF_8).replace("%2B", "+") }
+    return mapValues { (_, value) -> URLEncoder.encode(value, Charsets.UTF_8) }
 }
 
 private fun JsonArray.textAt(index: Int): String = elementAtOrNull(index)?.stringOrNull().orEmpty()
